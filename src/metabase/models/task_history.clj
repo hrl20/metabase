@@ -44,7 +44,7 @@
                                                                                :order-by [[:ended_at :desc]]})]
     (t2/delete! (t2/table-name :model/TaskHistory) :ended_at [:<= clean-before-date])))
 
-(def ^:private task-history-status #{:started :success :failed})
+(def ^:private task-history-status #{:started :success :failed :unknown})
 
 (defn- assert-task-history-status
   [status]
@@ -64,15 +64,40 @@
   {:task_details mi/transform-json-eliding
    :status       mi/transform-keyword})
 
+(defn- filter->where
+  [{:keys [status task] :as filter}]
+  (when (not-empty filter)
+    {:where (cond-> [:and]
+              task   (conj [:= :task task])
+              status (conj [:= :status (name status)]))}))
+
+(def Filter
+  "Schema for filter for task history."
+  [:maybe [:map [:status {:optional true} (into [:enum] task-history-status)
+                 :task   {:optional true} [:string {:min 1}]]]])
+
 (mu/defn all
-  "Return all TaskHistory entries, applying `limit` and `offset` if not nil"
+  "Return all TaskHistory entries, filtered if `filter` is provided, applying `limit` and `offset` if not nil."
   [limit  :- [:maybe ms/PositiveInt]
-   offset :- [:maybe ms/IntGreaterThanOrEqualToZero]]
+   offset :- [:maybe ms/IntGreaterThanOrEqualToZero]
+   filter :- Filter]
   (t2/select :model/TaskHistory (merge {:order-by [[:started_at :desc]]}
+                                       (filter->where filter)
                                        (when limit
                                          {:limit limit})
                                        (when offset
                                          {:offset offset}))))
+
+(mu/defn total
+  "Return count of all, or filtered if `filter` is provided, task history entries."
+  [filter :- Filter]
+  (t2/count :model/TaskHistory ((fnil identity {}) (filter->where filter))))
+
+(defn unique-tasks
+  "Return _vector_ of all unique tasks' names in alphabetical order."
+  []
+  (vec (t2/select-fn-vec :task [:model/TaskHistory :task] {:group-by [:task]
+                                                           :order-by [:task]})))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                            with-task-history macro                                             |
