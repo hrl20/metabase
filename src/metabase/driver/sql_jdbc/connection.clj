@@ -74,7 +74,7 @@
   driver/dispatch-on-initialized-driver
   :hierarchy #'driver/hierarchy)
 
-(defmulti connection-pool-spec 
+(defmulti connection-pool-spec
   "Create a new connection pool for a JDBC `spec` and return a spec for it. Optionally pass a map of connection pool
   properties -- see https://www.mchange.com/projects/c3p0/#configuration_properties for a description of valid options
   and their default values."
@@ -193,12 +193,12 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
    ;; stack trace, but clj-memory-meter reports ~800 bytes for a fresh Exception created at the REPL (which presumably
    ;; has a smaller-than-average stack).
    "debugUnreturnedConnectionStackTraces" (u/prog1 (jdbc-data-warehouse-debug-unreturned-connection-stack-traces)
-                                            (when (and <> (not (logger/level-enabled? 'com.mchange Level/INFO)))
-                                              (log/warn "jdbc-data-warehouse-debug-unreturned-connection-stack-traces"
-                                                        "is enabled, but INFO logging is not enabled for the"
-                                                        "com.mchange namespace. You must raise the log level for"
-                                                        "com.mchange to INFO via a custom log4j config in order to"
-                                                        "see stacktraces in the logs.")))
+                                                   (when (and <> (not (logger/level-enabled? 'com.mchange Level/INFO)))
+                                                     (log/warn "jdbc-data-warehouse-debug-unreturned-connection-stack-traces"
+                                                               "is enabled, but INFO logging is not enabled for the"
+                                                               "com.mchange namespace. You must raise the log level for"
+                                                               "com.mchange to INFO via a custom log4j config in order to"
+                                                               "see stacktraces in the logs.")))
    ;; Set the data source name so that the c3p0 JMX bean has a useful identifier, which incorporates the DB ID, driver,
    ;; and name from the details
    "dataSourceName"               (format "db-%d-%s-%s"
@@ -206,8 +206,7 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                                           (name driver)
                                           (data-source-name driver (:details database)))})
 
-
-(defmethod connection-pool-spec :default 
+(defmethod connection-pool-spec :default
   [_driver {:keys [^DataSource datasource], :as spec} pool-properties]
   (if datasource
     {:datasource (DataSources/pooledDataSource datasource (connection-pool/map->properties pool-properties))}
@@ -331,16 +330,16 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                                 ;; was passed in (ex: from a long-running sync operation); fetch the latest one from
                                 ;; our app DB, and see if it STILL doesn't match
                                 (not= curr-hash (-> (t2/select-one [:model/Database :id :engine :details] :id database-id)
-                                                    jdbc-spec-hash)))) 
+                                                    jdbc-spec-hash))))
                             (when log-invalidation?
                               (log-jdbc-spec-hash-change-msg! db-id))
 
                             (let [{:keys [password-expiry-timestamp]} details]
                               (and (int? password-expiry-timestamp)
                                    (<= password-expiry-timestamp (System/currentTimeMillis))))
-                            
+
                             (when log-invalidation?
-                              (log-password-expiry! db-id)) 
+                              (log-password-expiry! db-id))
 
                             (nil? (:tunnel-session details)) ; no tunnel in use; valid
                             details
@@ -349,24 +348,23 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                             details
 
                             :else ; tunnel in use, and not open; invalid
-                            
+
                             (when log-invalidation?
                               (log-ssh-tunnel-reconnect-msg! db-id)))))]
-                        (or
+      (or
        ;; we have an existing pool for this database, so use it
-                         (let [result (get-fn database-id true)]
+       (get-fn database-id true)
        ;; Even tho `set-pool!` will properly shut down old pools if two threads call this method at the same time, we
        ;; don't want to end up with a bunch of simultaneous threads creating pools only to have them destroyed the
+       ;; very next instant. This will cause their queries to fail. Thus we should do the usual locking here and make
        ;; sure only one thread will be creating a pool at a given instant.
-                           (locking database-id->connection-pool
-                             (or
+       (locking database-id->connection-pool
+         (or
           ;; check if another thread created the pool while we were waiting to acquire the lock
-                              (let [result (get-fn database-id false)]
-                                (when result
-                                  result))
+          (get-fn database-id false)
           ;; create a new pool and add it to our cache, then return it
-                              (u/prog1 (create-pool! db)
-                                       (set-pool! database-id <> db)))))))
+          (u/prog1 (create-pool! db)
+                   (set-pool! database-id <> db))))))
 
     ;; already a `clojure.java.jdbc` spec map
     (map? db-or-id-or-spec)
