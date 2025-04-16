@@ -1,7 +1,8 @@
 (ns metabase.driver.sql-jdbc.execute.diagnostic
   "Code related to capturing diagnostic information for JDBC connection pools at execution time."
   (:import
-   (com.mchange.v2.c3p0 PoolBackedDataSource)))
+   (com.mchange.v2.c3p0 PoolBackedDataSource)
+   javax.sql.DataSource))
 
 (set! *warn-on-reflection* true)
 
@@ -30,6 +31,7 @@
   [[diagnostic-info-fn-binding] & body]
   `(do-with-diagnostic-info (fn [~diagnostic-info-fn-binding] ~@body)))
 
+
 (defn record-diagnostic-info-for-pool!
   "Captures diagnostic info related to the given `driver`, `database-id`, and `datasource` (which are all related).
   The current information that is captured (in a map whose keys are namespaced keywords in this ns) is:
@@ -40,10 +42,17 @@
   * `::total-connections`: the number of total connections in the given datasource's pool
   * `::threads-waiting`: the number of threads waiting to get a connection to the given datasource's pool (which happens
                          when the number of active connections has reached the max size)."
-  [driver database-id ^PoolBackedDataSource datasource]
+  [driver database-id ^DataSource datasource]
   (when *diagnostic-info*
-    (swap! *diagnostic-info* #(assoc % ::database-id        database-id
-                                     ::driver             driver
-                                     ::active-connections (.getNumBusyConnectionsAllUsers datasource)
-                                     ::total-connections  (.getNumConnectionsAllUsers datasource)
-                                     ::threads-waiting    (.getNumThreadsAwaitingCheckoutDefaultUser datasource)))))
+    (let [base-info {::database-id database-id
+                     ::driver driver}]
+      (if (instance? PoolBackedDataSource datasource)
+        ;; If it's a PoolBackedDataSource, we can get detailed connection info
+        (swap! *diagnostic-info* #(assoc %
+                                         ::database-id database-id
+                                         ::driver driver
+                                         ::active-connections (.getNumBusyConnectionsAllUsers ^PoolBackedDataSource datasource)
+                                         ::total-connections (.getNumConnectionsAllUsers ^PoolBackedDataSource datasource)
+                                         ::threads-waiting (.getNumThreadsAwaitingCheckoutDefaultUser ^PoolBackedDataSource datasource)))
+        ;; Otherwise, just record the basic info
+        (swap! *diagnostic-info* #(merge % base-info))))))
