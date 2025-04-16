@@ -308,28 +308,20 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
     (let [database-id (u/the-id db-or-id-or-spec)
           ;; we need the Database instance no matter what (in order to compare details hash with cached value)
           db          (or (when (mi/instance-of? :model/Database db-or-id-or-spec)
-                            (println "Using Database instance directly")
                             (lib.metadata.jvm/instance->metadata db-or-id-or-spec :metadata/database))
                           (when (= (:lib/type db-or-id-or-spec) :metadata/database)
-                            (println "Using metadata/database instance")
                             db-or-id-or-spec)
-                          (do
-                            (println "Fetching database from metadata provider")
-                            (qp.store/with-metadata-provider database-id
-                              (lib.metadata/database (qp.store/metadata-provider)))))
+                          (qp.store/with-metadata-provider database-id
+                            (lib.metadata/database (qp.store/metadata-provider))))
           get-fn      (fn [db-id log-invalidation?]
                         (let [details (get @database-id->connection-pool db-id ::not-found)]
                           (cond
                             ;; for the audit db, we pass the datasource for the app-db
                             (:is-audit db)
-                            (do
-                              (println "Using application database data source for audit database")
-                              {:datasource (mdb/data-source)})
+                            {:datasource (mdb/data-source)}
 
                             (= ::not-found details)
-                            (do
-                              (println "No existing connection pool found")
-                              nil)
+                            nil
 
                             ;; details hash changed from what is cached; invalid
                             (let [curr-hash (get @database-id->jdbc-spec-hash db-id)
@@ -343,7 +335,6 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                             (do
                               (when log-invalidation?
                                 (log-jdbc-spec-hash-change-msg! db-id))
-                              (println "Connection pool invalid due to hash change")
                               nil)
 
                             (let [{:keys [password-expiry-timestamp]} details]
@@ -352,24 +343,18 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                             (do
                               (when log-invalidation?
                                 (log-password-expiry! db-id))
-                              (println "Connection pool invalid due to password expiry")
                               nil)
 
                             (nil? (:tunnel-session details)) ; no tunnel in use; valid
-                            (do
-                              (println "Using connection pool without tunnel")
-                              details)
+                            details
 
                             (ssh/ssh-tunnel-open? details) ; tunnel in use, and open; valid
-                            (do
-                              (println "Using connection pool with open tunnel")
-                              details)
+                            details
 
                             :else ; tunnel in use, and not open; invalid
                             (do
                               (when log-invalidation?
                                 (log-ssh-tunnel-reconnect-msg! db-id))
-                              (println "Connection pool invalid due to closed tunnel")
                               nil))))]
       (or
        ;; we have an existing pool for this database, so use it
@@ -382,27 +367,20 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
           ;; check if another thread created the pool while we were waiting to acquire the lock
           (let [result (get-fn database-id false)]
             (when result
-              (println "Using connection pool created by another thread")
               result))
           ;; create a new pool and add it to our cache, then return it
-          (do
-            (println "Creating new connection pool")
-            (u/prog1 (create-pool! db)
-              (set-pool! database-id <> db)))))))
+          (u/prog1 (create-pool! db)
+            (set-pool! database-id <> db)))))))
 
     ;; already a `clojure.java.jdbc` spec map
     (map? db-or-id-or-spec)
-    (do
-      (println "Using provided JDBC spec map directly")
-      db-or-id-or-spec)
+    db-or-id-or-spec
 
     ;; invalid. Throw Exception
     :else
-    (do
-      (println "Invalid input type:" (class db-or-id-or-spec))
-      (throw (ex-info (tru "Not a valid Database/Database ID/JDBC spec")
-                      ;; don't log the actual spec lest we accidentally expose credentials
-                      {:input (class db-or-id-or-spec)})))))
+    (throw (ex-info (tru "Not a valid Database/Database ID/JDBC spec")
+                    ;; don't log the actual spec lest we accidentally expose credentials
+                    {:input (class db-or-id-or-spec)}))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             metabase.driver impls                                              |
