@@ -73,6 +73,14 @@
   driver/dispatch-on-initialized-driver
   :hierarchy #'driver/hierarchy)
 
+(defmulti connection-pool-spec 
+  "Create a new connection pool for a JDBC `spec` and return a spec for it. Optionally pass a map of connection pool
+  properties -- see https://www.mchange.com/projects/c3p0/#configuration_properties for a description of valid options
+  and their default values."
+  {:added "0.45.0", :arglists '([driver spec properties])}
+  driver/dispatch-on-initialized-driver
+  :hierarchy #'driver/hierarchy)
+
 (defmethod data-source-name :default
   [_driver details]
   ((some-fn :db
@@ -121,83 +129,86 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
 
 (defmethod data-warehouse-connection-pool-properties :default
   [driver database]
-  {;; only fetch one new connection at a time, rather than batching fetches (default = 3 at a time). This is done in
-   ;; interest of minimizing memory consumption
-   "acquireIncrement"             1
-   ;; Never retry instead of the default of retrying 30 times (#51176)
-   ;; While a couple queries may fail during a reboot, this should allow quicker recovery and less spinning on outdated
-   ;; credentials
-   ;; However, keep 1 retry for the tests to reduce flakiness.
-   "acquireRetryAttempts"         (if config/is-test? 1 0)
-   ;; [From dox] Seconds a Connection can remain pooled but unused before being discarded.
-   "maxIdleTime"                  (* 3 60 60) ; 3 hours
-   "minPoolSize"                  1
-   "initialPoolSize"              1
-   "maxPoolSize"                  (jdbc-data-warehouse-max-connection-pool-size)
-   ;; [From dox] If true, an operation will be performed at every connection checkout to verify that the connection is
-   ;; valid. [...] ;; Testing Connections in checkout is the simplest and most reliable form of Connection testing,
-   ;; but for better performance, consider verifying connections periodically using `idleConnectionTestPeriod`. [...]
-   ;; If clients usually make complex queries and/or perform multiple operations, adding the extra cost of one fast
-   ;; test per checkout will not much affect performance.
-   ;;
-   ;; As noted in the C3P0 dox, this does add some overhead, but since all of our drivers are JDBC 4 drivers, they can
-   ;; call `Connection.isValid()`, which is reasonably efficient. In my profiling enabling this adds ~100µs for
-   ;; Postgres databases on the same machince and ~70ms for remote databases on AWS east testing against a local
-   ;; server on the West Coast.
-   ;;
-   ;; This suggests the additional cost of this test is more or less based entirely to the network latency of the
-   ;; request. IRL the Metabase server and data warehouse are likely to be located in closer geographical proximity to
-   ;; one another than my trans-contintental tests. Thus in the majority of cases the overhead should be next to
-   ;; nothing, and in the worst case close to imperceptible.
-   "testConnectionOnCheckout"     true
-   ;; [From dox] Number of seconds that Connections in excess of minPoolSize should be permitted to remain idle in the
-   ;; pool before being culled. Intended for applications that wish to aggressively minimize the number of open
-   ;; Connections, shrinking the pool back towards minPoolSize if, following a spike, the load level diminishes and
-   ;; Connections acquired are no longer needed. If maxIdleTime is set, maxIdleTimeExcessConnections should be smaller
-   ;; if the parameter is to have any effect.
-   ;;
-   ;; Kill idle connections above the minPoolSize after 5 minutes.
-   "maxIdleTimeExcessConnections" (* 5 60)
-   ;; [From dox] Seconds. If set, if an application checks out but then fails to check-in [i.e. close()] a Connection
-   ;; within the specified period of time, the pool will unceremoniously destroy() the Connection. This permits
-   ;; applications with occasional Connection leaks to survive, rather than eventually exhausting the Connection
-   ;; pool. And that's a shame. Zero means no timeout, applications are expected to close() their own
-   ;; Connections. Obviously, if a non-zero value is set, it should be to a value longer than any Connection should
-   ;; reasonably be checked-out. Otherwise, the pool will occasionally kill Connections in active use, which is bad.
-   ;;
-   ;; This should be the same as the query timeout. This theoretically shouldn't happen since the QP should kill
-   ;; things after a certain timeout but it's better to be safe than sorry -- it seems like in practice some
-   ;; connections disappear into the ether
-   "unreturnedConnectionTimeout"  (jdbc-data-warehouse-unreturned-connection-timeout-seconds)
-   ;; [From dox] If true, and if unreturnedConnectionTimeout is set to a positive value, then the pool will capture
-   ;; the stack trace (via an Exception) of all Connection checkouts, and the stack traces will be printed when
-   ;; unreturned checked-out Connections timeout. This is intended to debug applications with Connection leaks, that
-   ;; is applications that occasionally fail to return Connections, leading to pool growth, and eventually
-   ;; exhaustion (when the pool hits maxPoolSize with all Connections checked-out and lost). This parameter should
-   ;; only be set while debugging, as capturing the stack trace will slow down every Connection check-out.
-   ;;
-   ;; As noted in the C3P0 docs, this does add some overhead to create the Exception at Connection checkout.
-   ;; criterium/quick-bench indicates this is ~600ns of overhead per Exception created on my laptop, which is small
-   ;; compared to the overhead added by testConnectionCheckout, above. The memory usage will depend on the size of the
-   ;; stack trace, but clj-memory-meter reports ~800 bytes for a fresh Exception created at the REPL (which presumably
-   ;; has a smaller-than-average stack).
-   "debugUnreturnedConnectionStackTraces" (u/prog1 (jdbc-data-warehouse-debug-unreturned-connection-stack-traces)
-                                            (when (and <> (not (logger/level-enabled? 'com.mchange Level/INFO)))
-                                              (log/warn "jdbc-data-warehouse-debug-unreturned-connection-stack-traces"
-                                                        "is enabled, but INFO logging is not enabled for the"
-                                                        "com.mchange namespace. You must raise the log level for"
-                                                        "com.mchange to INFO via a custom log4j config in order to"
-                                                        "see stacktraces in the logs.")))
-   ;; Set the data source name so that the c3p0 JMX bean has a useful identifier, which incorporates the DB ID, driver,
-   ;; and name from the details
-   "dataSourceName"               (format "db-%d-%s-%s"
-                                          (u/the-id database)
-                                          (name driver)
-                                          (data-source-name driver (:details database)))})
+  
+  (let [props {;; only fetch one new connection at a time, rather than batching fetches (default = 3 at a time). This is done in
+               ;; interest of minimizing memory consumption
+               "acquireIncrement"             1
+               ;; Never retry instead of the default of retrying 30 times (#51176)
+               ;; While a couple queries may fail during a reboot, this should allow quicker recovery and less spinning on outdated
+               ;; credentials
+               ;; However, keep 1 retry for the tests to reduce flakiness.
+               "acquireRetryAttempts"         (if config/is-test? 1 0)
+               ;; [From dox] Seconds a Connection can remain pooled but unused before being discarded.
+               "maxIdleTime"                  (* 3 60 60) ; 3 hours
+               "minPoolSize"                  1
+               "initialPoolSize"              1
+               "maxPoolSize"                  (jdbc-data-warehouse-max-connection-pool-size)
+               ;; [From dox] If true, an operation will be performed at every connection checkout to verify that the connection is
+               ;; valid. [...] ;; Testing Connections in checkout is the simplest and most reliable form of Connection testing,
+               ;; but for better performance, consider verifying connections periodically using `idleConnectionTestPeriod`. [...]
+               ;; If clients usually make complex queries and/or perform multiple operations, adding the extra cost of one fast
+               ;; test per checkout will not much affect performance.
+               ;;
+               ;; As noted in the C3P0 dox, this does add some overhead, but since all of our drivers are JDBC 4 drivers, they can
+               ;; call `Connection.isValid()`, which is reasonably efficient. In my profiling enabling this adds ~100µs for
+               ;; Postgres databases on the same machince and ~70ms for remote databases on AWS east testing against a local
+               ;; server on the West Coast.
+               ;;
+               ;; This suggests the additional cost of this test is more or less based entirely to the network latency of the
+               ;; request. IRL the Metabase server and data warehouse are likely to be located in closer geographical proximity to
+               ;; one another than my trans-contintental tests. Thus in the majority of cases the overhead should be next to
+               ;; nothing, and in the worst case close to imperceptible.
+               "testConnectionOnCheckout"     true
+               ;; [From dox] Number of seconds that Connections in excess of minPoolSize should be permitted to remain idle in the
+               ;; pool before being culled. Intended for applications that wish to aggressively minimize the number of open
+               ;; Connections, shrinking the pool back towards minPoolSize if, following a spike, the load level diminishes and
+               ;; Connections acquired are no longer needed. If maxIdleTime is set, maxIdleTimeExcessConnections should be smaller
+               ;; if the parameter is to have any effect.
+               ;;
+               ;; Kill idle connections above the minPoolSize after 5 minutes.
+               "maxIdleTimeExcessConnections" (* 5 60)
+               ;; [From dox] Seconds. If set, if an application checks out but then fails to check-in [i.e. close()] a Connection
+               ;; within the specified period of time, the pool will unceremoniously destroy() the Connection. This permits
+               ;; applications with occasional Connection leaks to survive, rather than eventually exhausting the Connection
+               ;; pool. And that's a shame. Zero means no timeout, applications are expected to close() their own
+               ;; Connections. Obviously, if a non-zero value is set, it should be to a value longer than any Connection should
+               ;; reasonably be checked-out. Otherwise, the pool will occasionally kill Connections in active use, which is bad.
+               ;;
+               ;; This should be the same as the query timeout. This theoretically shouldn't happen since the QP should kill
+               ;; things after a certain timeout but it's better to be safe than sorry -- it seems like in practice some
+               ;; connections disappear into the ether
+               "unreturnedConnectionTimeout"  (jdbc-data-warehouse-unreturned-connection-timeout-seconds)
+               ;; [From dox] If true, and if unreturnedConnectionTimeout is set to a positive value, then the pool will capture
+               ;; the stack trace (via an Exception) of all Connection checkouts, and the stack traces will be printed when
+               ;; unreturned checked-out Connections timeout. This is intended to debug applications with Connection leaks, that
+               ;; is applications that occasionally fail to return Connections, leading to pool growth, and eventually
+               ;; exhaustion (when the pool hits maxPoolSize with all Connections checked-out and lost). This parameter should
+               ;; only be set while debugging, as capturing the stack trace will slow down every Connection check-out.
+               ;;
+               ;; As noted in the C3P0 docs, this does add some overhead to create the Exception at Connection checkout.
+               ;; criterium/quick-bench indicates this is ~600ns of overhead per Exception created on my laptop, which is small
+               ;; compared to the overhead added by testConnectionCheckout, above. The memory usage will depend on the size of the
+               ;; stack trace, but clj-memory-meter reports ~800 bytes for a fresh Exception created at the REPL (which presumably
+               ;; has a smaller-than-average stack).
+               "debugUnreturnedConnectionStackTraces" (u/prog1 (jdbc-data-warehouse-debug-unreturned-connection-stack-traces)
+                                                        (when (and <> (not (logger/level-enabled? 'com.mchange Level/INFO)))
+                                                          (log/warn "jdbc-data-warehouse-debug-unreturned-connection-stack-traces"
+                                                                    "is enabled, but INFO logging is not enabled for the"
+                                                                    "com.mchange namespace. You must raise the log level for"
+                                                                    "com.mchange to INFO via a custom log4j config in order to"
+                                                                    "see stacktraces in the logs.")))
+               ;; Set the data source name so that the c3p0 JMX bean has a useful identifier, which incorporates the DB ID, driver,
+               ;; and name from the details
+               "dataSourceName"               (format "db-%d-%s-%s"
+                                                      (u/the-id database)
+                                                      (name driver)
+                                                      (data-source-name driver (:details database)))}]
+    props))
 
-(defn- connection-pool-spec
-  "Like [[connection-pool/connection-pool-spec]] but also handles situations when the unpooled spec is a `:datasource`."
-  [{:keys [^DataSource datasource], :as spec} pool-properties]
+
+
+(defmethod connection-pool-spec :default 
+  [_driver {:keys [^DataSource datasource], :as spec} pool-properties]
   (if datasource
     {:datasource (DataSources/pooledDataSource datasource (connection-pool/map->properties pool-properties))}
     (connection-pool/connection-pool-spec spec pool-properties)))
@@ -224,7 +235,7 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
         spec                (connection-details->spec driver details-with-auth)
         properties          (data-warehouse-connection-pool-properties driver database)]
     (merge
-     (connection-pool-spec spec properties)
+     (connection-pool-spec driver spec properties)
      ;; also capture entries related to ssh tunneling for later use
      (select-keys spec [:tunnel-enabled :tunnel-session :tunnel-tracker :tunnel-entrance-port :tunnel-entrance-host])
      ;; remember when the password expires
@@ -284,33 +295,39 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
 (defn- log-password-expiry! [db-id]
   (log/warn (u/format-color :yellow "Password of database %s expired; marking pool invalid to reopen it" db-id))
   nil)
-
 (defn db->pooled-connection-spec
   "Return a JDBC connection spec that includes a c3p0 `ComboPooledDataSource`. These connection pools are cached so we
   don't create multiple ones for the same DB."
   [db-or-id-or-spec]
+  (println "db->pooled-connection-spec called with" (str {:db-or-id-or-spec db-or-id-or-spec}))
   (cond
     ;; db-or-id-or-spec is a Database instance or an integer ID
     (u/id db-or-id-or-spec)
     (let [database-id (u/the-id db-or-id-or-spec)
           ;; we need the Database instance no matter what (in order to compare details hash with cached value)
           db          (or (when (mi/instance-of? :model/Database db-or-id-or-spec)
+                            (println "Using Database instance directly")
                             (lib.metadata.jvm/instance->metadata db-or-id-or-spec :metadata/database))
                           (when (= (:lib/type db-or-id-or-spec) :metadata/database)
+                            (println "Using metadata/database instance")
                             db-or-id-or-spec)
-                          (qp.store/with-metadata-provider database-id
-                            (lib.metadata/database (qp.store/metadata-provider))))
+                          (do
+                            (println "Fetching database from metadata provider")
+                            (qp.store/with-metadata-provider database-id
+                              (lib.metadata/database (qp.store/metadata-provider)))))
           get-fn      (fn [db-id log-invalidation?]
                         (let [details (get @database-id->connection-pool db-id ::not-found)]
                           (cond
-                            ;; for the audit db, we pass the datasource for the app-db. This lets us use fewer db
-                            ;; connections with *application-db* and 1 less connection pool. Note: This data-source is
-                            ;; not in [[database-id->connection-pool]].
+                            ;; for the audit db, we pass the datasource for the app-db
                             (:is-audit db)
-                            {:datasource (mdb/data-source)}
+                            (do
+                              (println "Using application database data source for audit database")
+                              {:datasource (mdb/data-source)})
 
                             (= ::not-found details)
-                            nil
+                            (do
+                              (println "No existing connection pool found")
+                              nil)
 
                             ;; details hash changed from what is cached; invalid
                             (let [curr-hash (get @database-id->jdbc-spec-hash db-id)
@@ -321,27 +338,43 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                                 ;; our app DB, and see if it STILL doesn't match
                                 (not= curr-hash (-> (t2/select-one [:model/Database :id :engine :details] :id database-id)
                                                     jdbc-spec-hash))))
-                            (when log-invalidation?
-                              (log-jdbc-spec-hash-change-msg! db-id))
+                            (do
+                              (when log-invalidation?
+                                (log-jdbc-spec-hash-change-msg! db-id))
+                              (println "Connection pool invalid due to hash change")
+                              nil)
 
                             (let [{:keys [password-expiry-timestamp]} details]
                               (and (int? password-expiry-timestamp)
                                    (<= password-expiry-timestamp (System/currentTimeMillis))))
-                            (when log-invalidation?
-                              (log-password-expiry! db-id))
+                            (do
+                              (when log-invalidation?
+                                (log-password-expiry! db-id))
+                              (println "Connection pool invalid due to password expiry")
+                              nil)
 
                             (nil? (:tunnel-session details)) ; no tunnel in use; valid
-                            details
+                            (do
+                              (println "Using connection pool without tunnel")
+                              details)
 
                             (ssh/ssh-tunnel-open? details) ; tunnel in use, and open; valid
-                            details
+                            (do
+                              (println "Using connection pool with open tunnel")
+                              details)
 
                             :else ; tunnel in use, and not open; invalid
-                            (when log-invalidation?
-                              (log-ssh-tunnel-reconnect-msg! db-id)))))]
+                            (do
+                              (when log-invalidation?
+                                (log-ssh-tunnel-reconnect-msg! db-id))
+                              (println "Connection pool invalid due to closed tunnel")
+                              nil))))]
       (or
        ;; we have an existing pool for this database, so use it
-       (get-fn database-id true)
+       (let [result (get-fn database-id true)]
+         (when result
+           (println "Using existing connection pool")
+           result))
        ;; Even tho `set-pool!` will properly shut down old pools if two threads call this method at the same time, we
        ;; don't want to end up with a bunch of simultaneous threads creating pools only to have them destroyed the
        ;; very next instant. This will cause their queries to fail. Thus we should do the usual locking here and make
@@ -349,20 +382,29 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
        (locking database-id->connection-pool
          (or
           ;; check if another thread created the pool while we were waiting to acquire the lock
-          (get-fn database-id false)
+          (let [result (get-fn database-id false)]
+            (when result
+              (println "Using connection pool created by another thread")
+              result))
           ;; create a new pool and add it to our cache, then return it
-          (u/prog1 (create-pool! db)
-            (set-pool! database-id <> db))))))
+          (do
+            (println "Creating new connection pool")
+            (u/prog1 (create-pool! db)
+              (set-pool! database-id <> db)))))))
 
     ;; already a `clojure.java.jdbc` spec map
     (map? db-or-id-or-spec)
-    db-or-id-or-spec
+    (do
+      (println "Using provided JDBC spec map directly")
+      db-or-id-or-spec)
 
     ;; invalid. Throw Exception
     :else
-    (throw (ex-info (tru "Not a valid Database/Database ID/JDBC spec")
-                    ;; don't log the actual spec lest we accidentally expose credentials
-                    {:input (class db-or-id-or-spec)}))))
+    (do
+      (println "Invalid input type:" (class db-or-id-or-spec))
+      (throw (ex-info (tru "Not a valid Database/Database ID/JDBC spec")
+                      ;; don't log the actual spec lest we accidentally expose credentials
+                      {:input (class db-or-id-or-spec)})))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             metabase.driver impls                                              |

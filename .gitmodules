@@ -1,0 +1,3 @@
+[submodule "src/metabase/db/connection-pool"]
+	path = src/metabase/db/connection-pool
+	url = https://github.com/metabase/connection-pool.git
