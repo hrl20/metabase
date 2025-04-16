@@ -331,19 +331,16 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                                 ;; was passed in (ex: from a long-running sync operation); fetch the latest one from
                                 ;; our app DB, and see if it STILL doesn't match
                                 (not= curr-hash (-> (t2/select-one [:model/Database :id :engine :details] :id database-id)
-                                                    jdbc-spec-hash))))
-                            (do
-                              (when log-invalidation?
-                                (log-jdbc-spec-hash-change-msg! db-id))
-                              nil)
+                                                    jdbc-spec-hash)))) 
+                            (when log-invalidation?
+                              (log-jdbc-spec-hash-change-msg! db-id))
 
                             (let [{:keys [password-expiry-timestamp]} details]
                               (and (int? password-expiry-timestamp)
                                    (<= password-expiry-timestamp (System/currentTimeMillis))))
-                            (do
-                              (when log-invalidation?
-                                (log-password-expiry! db-id))
-                              nil)
+                            
+                            (when log-invalidation?
+                              (log-password-expiry! db-id)) 
 
                             (nil? (:tunnel-session details)) ; no tunnel in use; valid
                             details
@@ -352,25 +349,24 @@ For setting the maximum, see [MB_APPLICATION_DB_MAX_CONNECTION_POOL_SIZE](#mb_ap
                             details
 
                             :else ; tunnel in use, and not open; invalid
-                            (do
-                              (when log-invalidation?
-                                (log-ssh-tunnel-reconnect-msg! db-id))
-                              nil))))]
-      (or
+                            
+                            (when log-invalidation?
+                              (log-ssh-tunnel-reconnect-msg! db-id)))))]
+                        (or
        ;; we have an existing pool for this database, so use it
-       (let [result (get-fn database-id true)]
+                         (let [result (get-fn database-id true)]
        ;; Even tho `set-pool!` will properly shut down old pools if two threads call this method at the same time, we
        ;; don't want to end up with a bunch of simultaneous threads creating pools only to have them destroyed the
        ;; sure only one thread will be creating a pool at a given instant.
-       (locking database-id->connection-pool
-         (or
+                           (locking database-id->connection-pool
+                             (or
           ;; check if another thread created the pool while we were waiting to acquire the lock
-          (let [result (get-fn database-id false)]
-            (when result
-              result))
+                              (let [result (get-fn database-id false)]
+                                (when result
+                                  result))
           ;; create a new pool and add it to our cache, then return it
-          (u/prog1 (create-pool! db)
-            (set-pool! database-id <> db)))))))
+                              (u/prog1 (create-pool! db)
+                                       (set-pool! database-id <> db)))))))
 
     ;; already a `clojure.java.jdbc` spec map
     (map? db-or-id-or-spec)
