@@ -1,0 +1,6 @@
+[submodule "src/metabase/db/connection-pool"]
+	path = src/metabase/db/connection-pool
+	url = https://github.com/hrl20/connection-pool.git
+[submodule "modules/drivers/duckdb"]
+	path = modules/drivers/duckdb
+	url = https://github.com/motherduckdb/metabase_duckdb_driver.git
