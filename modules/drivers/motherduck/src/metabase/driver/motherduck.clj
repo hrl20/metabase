@@ -20,16 +20,15 @@
 (defmethod sql-jdbc.conn/connection-details->spec :motherduck
   [_driver details]
   ;; MotherDuck's Postgres endpoint (pg.<region>-aws.motherduck.com:5432) *requires* an encrypted
-  ;; connection; a non-SSL attempt just hangs until the client times out. Build the normal Postgres
-  ;; JDBC spec with SSL forced on, then set the two SSL params the Postgres *JDBC* driver needs:
+  ;; connection; a plaintext attempt just hangs until the client times out. Force SSL on and use
+  ;; `sslmode=require`, which encrypts the connection but does NOT attempt to verify the server
+  ;; certificate or hostname.
   ;;
-  ;;   sslmode=verify-full  -> encrypt AND verify the server certificate + hostname
-  ;;   sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory
-  ;;                        -> validate against the JVM's trust store, which already trusts
-  ;;                           Let's Encrypt's ISRG Root X1 (MotherDuck's CA).
+  ;; `verify-full` (encrypt + validate the cert chain and hostname against the JVM trust store) was
+  ;; tried first but the connection would hang/time out against the MotherDuck endpoint. `require` is
+  ;; confirmed working with the Postgres JDBC driver against MotherDuck, so we start there.
   ;;
-  ;; NOTE: the libpq `sslrootcert=system` value from the MotherDuck docs is a libpq feature and is
-  ;; NOT understood by the Postgres JDBC driver; DefaultJavaSSLFactory is the JDBC equivalent.
+  ;; Passing `:ssl true` to the Postgres `connection-details->spec` already yields `sslmode=require`
+  ;; when no explicit ssl-mode is set; we set it explicitly here to be unambiguous.
   (-> (sql-jdbc.conn/connection-details->spec :postgres (assoc details :ssl true))
-      (assoc :sslmode    "verify-full"
-             :sslfactory "org.postgresql.ssl.DefaultJavaSSLFactory")))
+      (assoc :sslmode "require")))
