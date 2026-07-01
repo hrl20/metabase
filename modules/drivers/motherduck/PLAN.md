@@ -343,7 +343,27 @@ substitute — see the duckdb driver's `describe-database`/`describe-table`.
 
 ---
 
-### T6 — Test-data extensions (`metabase.test.data.motherduck`) for the pg-based driver
+### ✅ T6 — Test-data extensions (`metabase.test.data.motherduck`) for the pg-based driver — DONE
+Implemented `modules/drivers/motherduck/test/metabase/test/data/motherduck.clj`. Writes go through
+DuckDB JDBC (`dbdef->spec :motherduck` builds a `md:<db>` DuckDB spec directly — no longer delegating
+to `connection-details->spec`, which is now Postgres); the driver-under-test reads/queries via the pg
+endpoint (`tx/dbdef->connection-details :motherduck` returns pg host/port/dbname/user/ssl, defaulting
+to the us-east-1 endpoint + cosmetic `metabase` user, overridable via `MB_MOTHERDUCK_TEST_*`).
+**Auth:** the MotherDuck token is read from `MOTHERDUCK_TOKEN` (env var, then a `MOTHERDUCK_TOKEN=`
+line in repo-root `.env`) and used *both* as the DuckDB JDBC connection token (loading) and as the
+Postgres password (the MotherDuck pg gateway authenticates with the token); `MB_MOTHERDUCK_TEST_PASSWORD`
+overrides the pg password if set. `tx/create-db!` creates the database over a `md:` workspace connection first,
+then delegates to `load-data/create-db!`. Ported `field-base-type->sql-type` (DuckDB dialect),
+`pk-sql-type`, `create-db-sql`, `drop-db-ddl-statements`, `add-fk-sql → nil`, `row-xform`,
+`sorts-nil-first? false`, and the test feature flags; `add-test-extensions! :motherduck` wires the
+`:sql-jdbc/test-extensions` parent. Verified the ns loads on the `:dev:drivers:drivers-dev` classpath
+and `dbdef->spec` returns the DuckDB spec.
+**Safe cleanup:** databases created during a run are tracked in a `created-databases` atom (populated
+in `create-db!` and `dataset-already-loaded?`); `after-run` drops **only** those, so a shared
+MotherDuck account's real databases are never touched (replaces the old "drop everything except
+`my_db`/`sample_data`" behavior). `before-run` just resets the atom.
+
+### T6 — original spec (superseded by the notes above)
 **File:** `modules/drivers/motherduck/test/metabase/test/data/motherduck.clj`
 (port from the T0-preserved copy of the duckdb module's version).
 **Spec:** Keep loading data via the **DuckDB JDBC client** (`md:` connection, workspace mode) but
