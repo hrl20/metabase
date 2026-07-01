@@ -478,7 +478,10 @@
     "modules/drivers/sqlite/test"
     "modules/drivers/sqlserver/test"
     "modules/drivers/starburst/test"
-    "modules/drivers/vertica/test"]}
+    "modules/drivers/vertica/test"
+    "modules/drivers/duckdb/test"
+    "modules/drivers/motherduck/test"
+    ]}
 
 ;;; Linters
 

@@ -23,4 +23,7 @@
   metabase/sqlite             {:local/root "sqlite"}
   metabase/sqlserver          {:local/root "sqlserver"}
   metabase/starburst          {:local/root "starburst"}
-  metabase/vertica            {:local/root "vertica"}}}
+  metabase/vertica            {:local/root "vertica"}
+  metabase/duckdb             {:local/root "duckdb"}
+  metabase/motherduck         {:local/root "motherduck"}
+  }}
