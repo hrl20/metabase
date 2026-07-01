@@ -406,9 +406,28 @@ Document required env vars for the run: `MB_MOTHERDUCK_TEST_HOST/PORT/USER/PASSW
 
 ---
 
-### T8 — Green integration test
+### ▶️ T8 — Green integration test (in progress)
 **Command:** `DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test`
-(with T7 env vars set).
+(with T7 env vars set). Auth: `.env` provides `MOTHERDUCK_TOKEN`; export it (and mirror to
+`PGPASSWORD` so the `motherduck-test` live smoke test also runs).
+
+**Progress (2026-07-01):**
+- ✅ Harness connects: `metabase.driver.motherduck-test` passes (5 assertions) — driver registers,
+  live pg connection reaches `current_database() = my_db`.
+- ✅ `metabase.driver.sql-jdbc.sync.describe-table-test` and
+  `metabase.query-processor.expression-aggregations-test` pass for `DRIVERS=motherduck` after the
+  loader fix below.
+- 🐞 **Test-loader bug fixed** (in `test/metabase/test/data/motherduck.clj`, *not* the driver): a
+  DuckDB `md:<db>` connection errors at connection startup if `<db>` doesn't yet exist
+  (`Failed to attach '<db>': no database/share named '<db>' found`). Two fixes:
+  1. `dataset-already-loaded?` read `database-name` from the *table* definition (always nil), so it
+     opened `md:null` → `Failed to attach 'null'`. Now reads `:database-name` from the **dbdef**.
+  2. `dbdef->spec` ignored `context` and always returned `md:<database-name>`; the `:server`
+     context ("no DB in particular", used before the DB exists for CREATE/DROP DATABASE) now
+     returns the workspace spec `md:` instead.
+- ▶️ **Next:** widen to the full `DRIVERS=motherduck` suite, triage failures per the buckets below.
+
+**Original spec:**
 **Spec:** Iterate until the standard driver test suite passes. Expected failure buckets & fixes:
 - **Query-execution divergence** (Postgres SQL that DuckDB rejects: date functions, casts, regex,
   `median`, interval math, etc.) → override the specific `sql.qp/*` / `read-column-thunk`

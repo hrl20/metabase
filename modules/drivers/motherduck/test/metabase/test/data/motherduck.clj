@@ -106,13 +106,18 @@
   []
   (duckdb-spec "md:"))
 
-;; All bulk writes (the parent `load-data/create-db!` uses this for both the `:server` CREATE
-;; DATABASE and the `:db` CREATE TABLE / INSERT statements) go through DuckDB JDBC, NOT the pg
-;; endpoint. The specific database exists by the time the `:db` connection is opened because
-;; `tx/create-db!` (below) creates it first over a workspace connection.
+;; All bulk writes go through DuckDB JDBC, NOT the pg endpoint. Context matters: a `md:<database-name>`
+;; connection can only be opened once that database exists (MotherDuck attaches it at connection
+;; startup and errors otherwise), so:
+;;  - `:server` ("no DB in particular" — used to run CREATE/DROP DATABASE, possibly before it exists)
+;;    connects in **workspace mode** (`md:`), which can see/create every database.
+;;  - `:db` connects to the **specific** database (`md:<database-name>`), which exists by the time the
+;;    `:db` connection is opened (the `:server` statements created it first).
 (defmethod dbdef->spec :motherduck
-  [_driver _context {:keys [database-name]}]
-  (duckdb-spec (format "md:%s" database-name)))
+  [_driver context {:keys [database-name]}]
+  (duckdb-spec (if (= context :server)
+                 "md:"
+                 (format "md:%s" database-name))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              DDL / type dialect                                                 |
@@ -187,7 +192,9 @@
   [driver dbdef]
   ;; Ensure the database exists (workspace mode), then check whether the first table has been
   ;; created via a DuckDB connection to that specific database.
-  (let [{:keys [table-name database-name]} (first (:table-definitions dbdef))]
+  ;; NOTE: `database-name` lives on the *dbdef*; only `table-name` comes from the table definition.
+  (let [database-name (:database-name dbdef)
+        table-name    (:table-name (first (:table-definitions dbdef)))]
     ;; This runs `CREATE DATABASE IF NOT EXISTS`, so the database may be created here too — track it
     ;; so cleanup will remove it even if `create-db!` isn't subsequently called.
     (swap! created-databases conj database-name)
