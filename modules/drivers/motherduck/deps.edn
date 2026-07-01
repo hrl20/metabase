@@ -1,0 +1,8 @@
+{:paths
+ ["src" "resources"]
+
+ ;; No production deps: the MotherDuck driver connects over the Postgres wire
+ ;; protocol and reuses org.postgresql.Driver, which is already on the core
+ ;; Metabase classpath. DuckDB JDBC (used only to load test data) is a
+ ;; test-only concern and is not declared here.
+ :deps {}}
