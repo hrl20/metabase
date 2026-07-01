@@ -26,8 +26,28 @@
   "test connection" pass.**
   - *Follow-up (not blocking):* revisit `verify-full` for stricter cert validation once the base path
     is solid (may need `sslrootcert` at the system trust store or a hostname-match investigation).
-- ▶️ **Next:** T5 metadata rewrite (the core of the task) → T6–T8 test-data loading + green integration
-  suite.
+- ✅ **T5 metadata rewrite complete.** All §2 overrides implemented in
+  `src/metabase/driver/motherduck.clj` using the validated §4 SQL and §5 type map:
+  `describe-database*`, `describe-fields-sql`, `describe-fields-pre-process-xf` (→ `:sql-jdbc`),
+  `describe-fks-sql`, `dynamic-database-types-lookup` (→ `nil`), `database-type->base-type`,
+  `column->semantic-type` (`JSON` → `:type/SerializedJSON`), `excluded-schemas`, and conservative
+  `database-supports?` feature flags. The driver builds/loads (`:motherduck (parents: [:postgres])`)
+  and the §4 SQL was re-confirmed green against a live MotherDuck db (`sample_data`). Two things worth
+  noting for later phases: (a) `database-type->base-type` tries the **Postgres** map first (lower-case
+  pg-wire names from query results, e.g. `timestamptz`→`:type/DateTimeWithLocalTZ`) and falls back to
+  the **DuckDB** pattern map applied to the upper-cased string (catalog names from sync, e.g.
+  `DECIMAL(10,2)`, `FLOAT[512]`, `TIMESTAMP WITH TIME ZONE`→`:type/DateTimeWithTZ`); (b) FK sync is
+  off by default (`:metadata/key-constraints false`) per §6, though `describe-fks-sql` still ships;
+  (c) **collection/nested types short-circuit before the pattern maps** — `T[]`/`T[N]`/`T[][]` →
+  `:type/Array`, `STRUCT`/`MAP`/`UNION` → `:type/Structured`. This was a real bug found via a running
+  sync: a `VARCHAR[]` column regex-matched `VARCHAR`→`:type/Text`, and fingerprinting then ran
+  `SUBSTRING(<array>, …)` which DuckDB rejects (`table_rows_sample` truncates only exact `:type/Text`).
+- ⚠️ **Known issue (in pocket → T9):** MotherDuck's pg-wire rejects legacy timezone aliases
+  (`US/Eastern`) on `SET SESSION TIMEZONE`; non-fatal (logged) but session TZ silently doesn't apply.
+  Workaround: set Report Timezone to a canonical IANA name (`America/New_York`). See T9.
+- ▶️ **Next:** T6–T8 test-data loading (DuckDB JDBC) + green integration suite. Still to validate
+  under a **running** Metabase sync: that the debug log shows the `duckdb_*` query (not pg_catalog),
+  and that a multi-database account syncs only `current_database()` objects.
 
 Two milestones:
 > 1. **Minimal connector** — `./bin/build-driver.sh motherduck && clojure -M:run:dev:drivers`
@@ -299,7 +319,7 @@ substitute — see the duckdb driver's `describe-database`/`describe-table`.
 
 ---
 
-### T5 — Metadata rewrite (the core of the task)
+### ✅ T5 — Metadata rewrite (the core of the task) — DONE
 **File:** `modules/drivers/motherduck/src/metabase/driver/motherduck.clj`
 **Spec:** Implement all overrides from §2 using the validated SQL in §4 and the type map in §5:
 1. `driver/describe-database` (or `describe-database*` — match whichever postgres overrides) → §4.1.
@@ -380,6 +400,40 @@ Document required env vars for the run: `MB_MOTHERDUCK_TEST_HOST/PORT/USER/PASSW
 - **Metadata mismatches** → adjust §4 SQL / §5 type map.
 **Acceptance:** the suite passes for `DRIVERS=motherduck`. Record any intentionally-disabled
 features and any skipped tests with justification.
+
+---
+
+### T9 — (Optional / in-pocket) Session-timezone alias remap
+**File:** `modules/drivers/motherduck/src/metabase/driver/motherduck.clj`
+**Problem (observed):** Metabase's global **Report Timezone** flows verbatim into
+`SET SESSION TIMEZONE TO '<tz>'` (Postgres's `set-timezone-sql`, inherited). MotherDuck's pg-wire
+endpoint **rejects legacy IANA aliases** — e.g. `US/Eastern` fails with
+`ERROR: invalid value for parameter "TimeZone": "US/Eastern"` — even though `pg_timezone_names()`
+lists `US/Eastern`. Canonical names (`America/New_York`) are accepted. The failure is caught + logged
+in `sql-jdbc.execute/set-time-zone-if-supported!`, so it is **not fatal**, but the session TZ silently
+does not apply (query results use the DB default zone). Likely a MotherDuck bug — file upstream.
+**Zero-code workaround (current recommendation):** set Report Timezone (Admin → Localization) to a
+canonical IANA name like `America/New_York`.
+**Spec (if we want the driver bulletproof for any user setting):** Override
+`sql-jdbc.execute/do-with-connection-with-options :motherduck` to canonicalize `:session-timezone`
+before delegating to the `:sql-jdbc` default (keeps `:motherduck` dispatch so the inherited postgres
+`set-timezone-sql` is still used):
+```clojure
+(defmethod sql-jdbc.execute/do-with-connection-with-options :motherduck
+  [driver db-or-id-or-spec options f]
+  ((get-method sql-jdbc.execute/do-with-connection-with-options :sql-jdbc)
+   driver db-or-id-or-spec
+   (cond-> options
+     (:session-timezone options) (update :session-timezone canonicalize-tz))
+   f))
+```
+**Constraint discovered:** the JVM has **no** API that canonicalizes a legacy alias → IANA canonical
+(`ZoneId/of`, `TimeZone/getTimeZone`, `.toZoneId`, `.normalized` all *preserve* `US/Eastern`). So
+`canonicalize-tz` must ship a static alias→canonical table (the IANA "backward" links, ~120 entries)
+or a curated subset (US/*, Canada/*, common legacy names) with pass-through fallback. This is why it's
+optional: real fix belongs in MotherDuck; the driver map is a maintenance cost.
+**Acceptance:** with Report Timezone = `US/Eastern`, a query runs without the `invalid value for
+parameter "TimeZone"` log error and results are in Eastern time.
 
 ---
 
