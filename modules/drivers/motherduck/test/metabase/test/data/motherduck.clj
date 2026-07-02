@@ -26,7 +26,12 @@
    [metabase.test.data.sql-jdbc.load-data :as load-data]
    [metabase.test.data.sql-jdbc.spec :refer [dbdef->spec]]
    [metabase.test.data.sql.ddl :as ddl]
-   [metabase.util.log :as log]))
+   [metabase.util.log :as log])
+  (:import
+   (java.sql PreparedStatement Time)
+   (java.time LocalDate LocalTime OffsetTime ZoneOffset)
+   (java.time.temporal ChronoField)
+   (org.duckdb DuckDBPreparedStatement)))
 
 (set! *warn-on-reflection* true)
 
@@ -41,6 +46,16 @@
 (defmethod tx/bad-connection-details :motherduck
   [_driver]
   {:unknown_config "single"})
+
+;; Inherited from `:postgres`, but that impl hardcodes the `public` schema; DuckDB/MotherDuck puts
+;; user tables in `main`.
+(defmethod tx/agg-venues-by-category-id :motherduck
+  [_driver]
+  "select category_id, array_agg(name)
+   from main.venues
+   group by category_id
+   order by 1 asc
+   limit 2;")
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                       Connection specs (pg + DuckDB JDBC)                                       |
@@ -163,6 +178,46 @@
   false)
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                    Parameter binding (DuckDB JDBC load path)                                    |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; The `:motherduck` driver binds query parameters over the *Postgres* JDBC driver in production, but
+;; the test-data loader inserts rows over the *DuckDB* JDBC driver. DuckDB's JDBC `setObject` rejects
+;; the explicit `java.sql.Types` that the inherited Postgres binding passes for temporal values —
+;; e.g. `setObject(i, <LocalDate>, Types.DATE)` throws `Unknown target type 91`. DuckDB instead wants
+;; the value bound *without* a target type (and, for DATE/TIME, pre-converted).
+;;
+;; `set-parameter` dispatches only on `[driver value-class]`, so these methods would also intercept
+;; the Postgres query path. We therefore branch on the concrete statement class: only rewrite the
+;; binding for a `DuckDBPreparedStatement`, and delegate everything else to the Postgres impl. These
+;; conversions are ported from the DuckDB community driver.
+(defn- delegate-set-parameter
+  "Invoke the binding that would apply if `:motherduck` had no override (i.e. the Postgres one)."
+  [driver ps i t]
+  ((get-method sql-jdbc.execute/set-parameter [:postgres (class t)]) driver ps i t))
+
+(defn- local-time->sql-time ^Time [^LocalTime lt]
+  (Time. (.getLong lt ChronoField/MILLI_OF_DAY)))
+
+(defmethod sql-jdbc.execute/set-parameter [:motherduck LocalDate]
+  [driver ^PreparedStatement ps i ^LocalDate t]
+  (if (instance? DuckDBPreparedStatement ps)
+    (.setObject ps i (.atStartOfDay t))          ; LocalDate -> LocalDateTime @ 00:00, no target type
+    (delegate-set-parameter driver ps i t)))
+
+(defmethod sql-jdbc.execute/set-parameter [:motherduck LocalTime]
+  [driver ^PreparedStatement ps i ^LocalTime t]
+  (if (instance? DuckDBPreparedStatement ps)
+    (.setObject ps i (local-time->sql-time t))
+    (delegate-set-parameter driver ps i t)))
+
+(defmethod sql-jdbc.execute/set-parameter [:motherduck OffsetTime]
+  [driver ^PreparedStatement ps i ^OffsetTime t]
+  (if (instance? DuckDBPreparedStatement ps)
+    (.setObject ps i (local-time->sql-time (.toLocalTime (.withOffsetSameInstant t ZoneOffset/UTC))))
+    (delegate-set-parameter driver ps i t)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                      create / load / cleanup lifecycle                                          |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
@@ -190,32 +245,37 @@
 
 (defmethod tx/dataset-already-loaded? :motherduck
   [driver dbdef]
-  ;; Ensure the database exists (workspace mode), then check whether the first table has been
-  ;; created via a DuckDB connection to that specific database.
+  ;; Check whether the dataset's first table already exists, by scanning `duckdb_tables()` over the
+  ;; **workspace** connection. In workspace mode `duckdb_tables()` reports tables across every
+  ;; database in the account without attaching/`USE`-ing a specific one, so we deliberately do NOT
+  ;; open a `md:<database-name>` connection here.
+  ;;
+  ;; Why this matters: MotherDuck's DuckDB-JDBC client caches a per-database instance keyed by the
+  ;; `md:<db>` URL and attaches that database's catalog at connection-open time. Under parallel test
+  ;; execution + `after-run` cleanup, another session can drop/recreate the database, leaving that
+  ;; cached instance stale — so opening `md:<db>` (or calling `.getTables` on it) fails hard with
+  ;; `Catalog '<db>' has been deleted`. A catalog *scan* over the workspace connection just returns
+  ;; zero rows for a missing database instead of throwing.
+  ;;
   ;; NOTE: `database-name` lives on the *dbdef*; only `table-name` comes from the table definition.
   (let [database-name (:database-name dbdef)
         table-name    (:table-name (first (:table-definitions dbdef)))]
-    ;; This runs `CREATE DATABASE IF NOT EXISTS`, so the database may be created here too — track it
-    ;; so cleanup will remove it even if `create-db!` isn't subsequently called.
+    ;; Track the name so `after-run` cleanup will drop it even if `create-db!` isn't subsequently
+    ;; called (cleanup only ever touches databases in this set — see `drop-created-databases!`).
     (swap! created-databases conj database-name)
     (sql-jdbc.execute/do-with-connection-with-options
      driver
      (md-workspace-spec)
-     {:write? true}
-     (fn [^java.sql.Connection conn]
-       (sql-jdbc.test-execute/execute-sql! driver conn (sql.tx/create-db-sql driver dbdef))))
-    (sql-jdbc.execute/do-with-connection-with-options
-     driver
-     (duckdb-spec (format "md:%s" database-name))
      {:write? false}
      (fn [^java.sql.Connection conn]
-       (with-open [rset (.getTables (.getMetaData conn)
-                                    #_catalog        database-name
-                                    #_schema-pattern nil
-                                    #_table-pattern  table-name
-                                    #_types          (into-array String ["BASE TABLE"]))]
-         ;; if the ResultSet returns anything we know the table is already loaded.
-         (.next rset))))))
+       (with-open [stmt (.prepareStatement
+                         conn
+                         "SELECT 1 FROM duckdb_tables() WHERE database_name = ? AND table_name = ? LIMIT 1")]
+         (.setString stmt 1 database-name)
+         (.setString stmt 2 table-name)
+         (with-open [rset (.executeQuery stmt)]
+           ;; a returned row means the table exists ⇒ dataset already loaded.
+           (.next rset)))))))
 
 (defn- drop-created-databases!
   "Drop only the databases this test run created (tracked in [[created-databases]]), leaving any

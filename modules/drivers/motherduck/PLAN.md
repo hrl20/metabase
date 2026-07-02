@@ -425,7 +425,45 @@ Document required env vars for the run: `MB_MOTHERDUCK_TEST_HOST/PORT/USER/PASSW
   2. `dbdef->spec` ignored `context` and always returned `md:<database-name>`; the `:server`
      context ("no DB in particular", used before the DB exists for CREATE/DROP DATABASE) now
      returns the workspace spec `md:` instead.
-- ▶️ **Next:** widen to the full `DRIVERS=motherduck` suite, triage failures per the buckets below.
+- 🐞 **Loader date/time param binding fixed:** inserting DATE/TIME rows over the DuckDB JDBC client
+  failed with `INSERT FAILED: Unknown target type 91` — DuckDB's `setObject(i, <LocalDate>,
+  Types.DATE)` rejects the explicit `java.sql.Types` that the inherited Postgres binding passes.
+  Added `set-parameter [:motherduck LocalDate|LocalTime|OffsetTime]` overrides (ported from the
+  DuckDB driver) that rewrite the binding **only when the statement is a `DuckDBPreparedStatement`**
+  (the test load path) and delegate to the Postgres impl otherwise (the prod query path). Lives in
+  the test ns since prod `:motherduck` never uses DuckDB JDBC.
+  - The `Catalog 'test-data' has been deleted` errors were a *secondary* cascade: this INSERT
+    failure tripped `create-database!`'s `catch`, which calls `destroy-db!` (NOT gated by
+    `:test/cannot-destroy-db`), dropping the shared-JVM DuckDB catalog and poisoning every other
+    `md:` connection. Also hardened `dataset-already-loaded?` to probe via a `duckdb_tables()` scan
+    over the **workspace** connection instead of opening a poison-prone `md:<db>` `.getTables`.
+- 🐞 **Native-query test helper schema fixed:** `agg-venues-by-category-id` is inherited from
+  `:postgres` and hardcodes `public.venues`; DuckDB/MotherDuck puts user tables in `main`. Overrode
+  it for `:motherduck` to use `main.venues`.
+- 🐞 **Array read path fixed (driver code):** MotherDuck's pg endpoint returns array columns as
+  `_text` (OID 2003) with **unquoted** elements even when they contain spaces
+  (`{Chez Jay,Musso & Frank}`); real Postgres quotes them. `org.postgresql`'s `PgArray.getArray()`
+  then collapses the interior whitespace (`Chez Jay` → `ChezJay`). `ResultSet.getString` returns the
+  literal intact, so added `read-column-thunk [:motherduck Types/ARRAY]` + a `parse-array-literal`
+  that parses the raw `{...}` text ourselves. **Driver-source change ⇒ rebuild the jar** before
+  re-testing (`./bin/build-driver.sh motherduck`).
+
+**🔎 Architecture finding — loading could move to the pg transport (probed 2026-07-01):**
+The pg endpoint **does** support `CREATE DATABASE` / `DROP DATABASE` / `CREATE TABLE` / multi-row
+parameterized `INSERT` (probed directly with the postgres JDBC driver + token; the only "failures"
+were `clojure.java.jdbc/execute!` complaining that DDL returned a status row — the writes succeeded,
+schema landed in `main`, and a `LocalDate` param round-tripped cleanly). This means the whole
+DuckDB-JDBC test loader could likely be replaced with the **Postgres transport** (inherited
+`connection-details->spec`), *keeping* the DuckDB SQL **dialect** overrides (CREATE/DROP DATABASE
+syntax, type map, `pk-sql-type`, `add-fk-sql → nil`). Doing so would eliminate the entire class of
+DuckDB-JDBC-only bugs fixed above: the `LocalDate` "type 91" binding, the shared-JVM
+"Catalog … deleted" poisoning, and the workspace/`md:<db>`/`dataset-already-loaded?` juggling.
+Caveat: no `md:`-only concept (no maintenance/no-db connection — attaching a nonexistent default
+db errors), so `:server`-context connect needs an existing db (e.g. connect to `my_db` to run
+CREATE/DROP DATABASE). **Decision pending** — see below.
+
+- ▶️ **Next:** decide loader transport (keep DuckDB-JDBC vs. switch to pg), then widen to the full
+  `DRIVERS=motherduck` suite, triaging per the buckets below.
 
 **Original spec:**
 **Spec:** Iterate until the standard driver test suite passes. Expected failure buckets & fixes:
