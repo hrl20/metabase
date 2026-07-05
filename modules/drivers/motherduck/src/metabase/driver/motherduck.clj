@@ -19,7 +19,8 @@
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
-   [metabase.util :as u])
+   [metabase.util :as u]
+   [metabase.util.honey-sql-2 :as h2x])
   (:import
    (java.sql ResultSet Types)))
 
@@ -255,6 +256,20 @@
 (defmethod sql-jdbc.sync/excluded-schemas :motherduck
   [_driver]
   #{"information_schema" "pg_catalog"})
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                              Query processing                                                   |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; A literal text expression (e.g. `[:value "foo" {:base_type :type/Text}]` in `:fields`/`:expressions`)
+;; compiles to a bare parameter placeholder — `SELECT ? AS "foo"`. MotherDuck's Postgres gateway can't
+;; deduce a result column's type from an untyped parameter and rejects the prepared statement with
+;; "ambiguous result column types". An explicit CAST gives it the type it needs. (Numbers and booleans
+;; get inlined upstream, so only string literals reach here — same fix as Redshift/Vertica.)
+(defmethod sql.qp/->honeysql [:motherduck ::sql.qp/expression-literal-text-value]
+  [driver [_ value]]
+  (->> (sql.qp/->honeysql driver value)
+       (h2x/cast :text)))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Result reading                                                     |

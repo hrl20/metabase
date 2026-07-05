@@ -21,7 +21,6 @@
    [metabase.driver.sql-jdbc.sync.describe-table-test :as describe-table-test]
    [metabase.test.data.interface :as tx]
    [metabase.test.data.sql :as sql.tx :refer [qualify-and-quote]]
-   [metabase.test.data.sql-jdbc :as sql-jdbc.tx]
    [metabase.test.data.sql-jdbc.execute :as sql-jdbc.test-execute]
    [metabase.test.data.sql-jdbc.load-data :as load-data]
    [metabase.test.data.sql-jdbc.spec :refer [dbdef->spec]]
@@ -35,11 +34,20 @@
 
 (set! *warn-on-reflection* true)
 
-(sql-jdbc.tx/add-test-extensions! :motherduck)
+;; We don't call `(sql-jdbc.tx/add-test-extensions! :motherduck)` here: `:motherduck` derives from
+;; `:postgres` (see `metabase.driver.motherduck`), and Postgres's test extensions already derive
+;; `:postgres` -> `:sql-jdbc/test-extensions`. So `:motherduck` inherits the SQL-JDBC test extensions
+;; transitively, and re-deriving them would trip `clojure.core/derive`'s "already has ... as ancestor"
+;; assertion. (Same reasoning as the Redshift test extensions.)
 
 (doseq [[feature supported?] {:upload-with-auto-pk (not config/is-test?)
                               :test/time-type false
                               ::describe-table-test/describe-materialized-view-fields false ; motherduck has no materialized views
+                              ;; `describe-fields-sql` reads PRIMARY KEY columns from `duckdb_constraints`
+                              ;; and emits `pk?`, even though `:metadata/key-constraints` is false (the
+                              ;; loader can't create FKs). Same situation as `:mongo`/`:sqlite`; the
+                              ;; `::describe-pks` proxy otherwise infers false from key-constraints.
+                              ::describe-table-test/describe-pks true
                               :test/cannot-destroy-db true}]
   (defmethod driver/database-supports? [:motherduck feature] [_driver _feature _db] supported?))
 
@@ -98,7 +106,13 @@
     :user     (tx/db-test-env-var :motherduck :user "metabase")
     :password (or (tx/db-test-env-var :motherduck :password) (motherduck-token))
     :ssl      true}
-   (when (= context :db)
+   ;; Attach the specific database for every context *except* `:server` (which runs CREATE/DROP
+   ;; DATABASE, possibly before the database exists). Unlike Postgres — which falls back to a default
+   ;; database when `dbname` is absent — MotherDuck's pg gateway defaults `dbname` to the *username*
+   ;; and fails with "failed to attach '<user>'" if that database doesn't exist. Some callers pass a
+   ;; `nil` context with a real `database-name` (e.g. the snowplow create-db API test), so gate on
+   ;; `:server` rather than only matching `:db`.
+   (when (and (not= context :server) database-name)
      {:dbname database-name})))
 
 (defn- duckdb-spec
@@ -152,6 +166,11 @@
   (defmethod sql.tx/field-base-type->sql-type [:motherduck base-type] [_ _] db-type))
 
 (defmethod sql.tx/pk-sql-type :motherduck [_] "INTEGER")
+
+;; Inherited from `:postgres` as "public", but DuckDB/MotherDuck put user tables in `main`. Tests that
+;; qualify table names with `(sql.tx/session-schema driver)` (renames, view creation, ...) otherwise
+;; target a nonexistent `public` schema.
+(defmethod sql.tx/session-schema :motherduck [_driver] "main")
 
 (defmethod sql.tx/create-db-sql :motherduck
   [driver {:keys [database-name]}]
