@@ -13,7 +13,7 @@ Format: one section per namespace; each fixed test listed with brief notes on th
 | metabase.query-processor.date-bucketing-test | 0/60 | pending |
 | metabase.channel.render.body-test (+card-test, pulse-integration-test) | 12/6 | pending |
 | metabase.permissions.models.collection.graph-test | 16/0 | pending |
-| metabase.query-processor.expressions-test | 0/13 | pending |
+| metabase.query-processor.expressions-test | 0/13 | ✅ all pass |
 | metabase.query-processor.cast-test | 0/8 | pending |
 | metabase.query-processor.filter-test | 0/8 | pending |
 | metabase.query-processor.alternative-date-test | 0/7 | pending |
@@ -25,9 +25,9 @@ Format: one section per namespace; each fixed test listed with brief notes on th
 | metabase.core.modules-test | 0/1 | pending |
 | metabase.driver.sql-jdbc.connection-test | 1/0 | pending |
 | metabase.indexed-entities.models.model-index-test | 0/1 | pending |
-| metabase.query-processor.case-test | 0/1 | pending |
-| metabase.query-processor.coercion-test | 0/1 | pending |
-| metabase.query-processor.cumulative-aggregation-test | 0/1 | pending |
+| metabase.query-processor.case-test | 0/1 | ✅ all pass |
+| metabase.query-processor.coercion-test | 0/1 | ✅ all pass |
+| metabase.query-processor.cumulative-aggregation-test | 0/1 | ✅ all pass |
 
 ## Fixes
 
@@ -45,3 +45,19 @@ Root causes & fixes (all in `modules/drivers/motherduck/src/metabase/driver/moth
    - Fixed: `convert-timezone-test`, `convert-timezone-test-1c`, `convert-timezone-test-3`, `nested-convert-timezone-test`, `nested-convert-timezone-test-3..5b`
 
 **Pattern for other agents:** any Postgres method that delegates to an h2x helper (they dispatch on the *bare* db-type keyword) needs an explicit `:motherduck` defmethod passing `:postgres`. Gateway ambiguous-param errors: inline string literals (`h2x/literal`), cast temporal params (`h2x/->pg-timestamp`).
+
+### metabase.query-processor.expressions-test — ✅ 120 tests, 0 fail/err (+ case-test, coercion-test, cumulative-aggregation-test, all ✅)
+
+The temporal-arithmetic tests in this cluster were already cured by the prior `add-interval-honeysql-form`/`current-datetime-honeysql-form` fix (see above); re-running after that commit left 11 errors, all new root causes:
+
+1. **Gateway "ambiguous result column types" on *any* bare string parameter, not just top-level literal expressions** — the existing `::sql.qp/expression-literal-text-value` fix only covered `[:value "foo" ...]` clauses used directly as a `:fields`/`:expressions` value. It missed plain strings reaching `->honeysql` from other contexts: `:case`/`:if` branch values (`if-test`, `weekday-numbers-and-names-test`/day-name-desugared-to-case), and non-column args to string functions like `CONCAT(col, ?)` (`expression-with-duplicate-column-name`, `case-with-literal-expression-test`, `nested-and-filtered-literal-expression-test`, `literal-expressions-inside-nested-and-filtered-aggregations-test`).
+   - **Fix**: replaced the narrow `::sql.qp/expression-literal-text-value` defmethod in `motherduck.clj` with a blanket `sql.qp/->honeysql [:motherduck String]` — every raw string literal that flows through `sql.qp/->honeysql` gets `CAST(? AS text)`, regardless of which clause produced it. This subsumes the old fix (that clause compiles to a plain string too) with less code than adding per-clause overrides.
+   - Fixed: `if-test` (case-test), `weekday-numbers-and-names-test`, `case-with-literal-expression-test`, `expression-with-duplicate-column-name`, `nested-and-filtered-literal-expression-test`, `literal-expressions-inside-nested-and-filtered-aggregations-test`, `string-operations-from-subquery` (partially — see #3)
+2. **Test-data loader: "A result was returned when none was expected" on multi-row `INSERT`** — `load-data/do-insert!` (in `test/metabase/test/data/motherduck.clj`) called `jdbc/execute!`, whose default path calls pgjdbc's `executeUpdate`/`executeBatch`. Those reject any returned result set — and the gateway returns one for every statement, INSERT included (see AGENTS.md). The driver already special-cases this for the *non-parameterized* `execute-sql!` path (raw `Statement.execute`), but `do-insert!`'s parameterized path still went through `jdbc/execute!`.
+   - **Fix**: rewrote `do-insert!` to build a `PreparedStatement` directly (`.prepareStatement` + `sql-jdbc.execute/set-parameters!` + `.execute`), bypassing `clojure.java.jdbc` entirely for this call so no code path invokes `executeUpdate`. Dropped the now-unused `clojure.java.jdbc` require.
+   - Fixed (were blocked at data-load time, not query time): `float-to-integer-coercion-test` (coercion-test), `offset-function-expression-breakout-test` (cumulative-aggregation-test), `coercion-with-expression-test`, `coercion-with-expression-test-2`
+3. **DuckDB has no Postgres `substring(str FROM pattern)` two-arg regex overload** — Postgres's `:regex-match-first` compiles to `substring(expr FROM ?)`, a POSIX-regex-specific overload that only Postgres has; DuckDB's `substring` only takes positional `(str, start[, len])` args, so it tries to coerce the pattern string to an integer position and DuckDB itself throws (`Conversion Error: Could not convert string '...' to INT64` — not a gateway ambiguous-param error, a real DuckDB runtime error).
+   - **Fix**: `sql.qp/->honeysql [:motherduck :regex-match-first]` emits `regexp_extract(expr, pattern)` instead — DuckDB's native regex function, default group 0 (whole match) matching `:regex-match-first` semantics. Copied verbatim from the sibling DuckDB community driver (`modules/drivers/duckdb/src/metabase/driver/duckdb.clj`), which already solved the identical problem — same backend, so no exploration needed.
+   - Fixed: `string-operations-from-subquery`
+
+**Pattern for other agents:** if you see "ambiguous result column types" from a query with a bare string constant *anywhere* in the query (not just as a returned field), check whether the blanket `[:motherduck String]` `->honeysql` override (added here) already covers it before writing a narrower fix — it should catch any string literal, in any clause position. For DuckDB-function-signature mismatches with Postgres (not gateway/param issues, but genuine SQL semantic differences), check `modules/drivers/duckdb/src/metabase/driver/duckdb.clj` first — same backend, likely already solved.

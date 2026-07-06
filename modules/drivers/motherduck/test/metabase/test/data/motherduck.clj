@@ -9,7 +9,6 @@
   from real Postgres."
   (:require
    [clojure.java.io :as io]
-   [clojure.java.jdbc :as jdbc]
    [clojure.string :as str]
    [metabase.config.core :as config]
    [metabase.driver :as driver]
@@ -188,18 +187,20 @@
   ;; `set-parameter` might try to look at the DB timezone; we don't want to do that while loading
   ;; the data because the DB hasn't been synced yet.
   (mt/with-database-timezone-id nil
-    (doseq [sql-args (ddl/insert-rows-dml-statements driver table-identifier rows)]
+    (doseq [[sql & params] (ddl/insert-rows-dml-statements driver table-identifier rows)]
       (try
-        ;; `:transaction? false` is load-bearing: the gateway always reports the session as IDLE in
-        ;; ReadyForQuery, so pgjdbc concludes no transaction is open and never sends the COMMIT for
-        ;; c.j.jdbc's default wrapping transaction — the inserted rows would be silently rolled
-        ;; back when the connection closes.
-        (jdbc/execute! {:connection conn} sql-args {:transaction?   false
-                                                    :set-parameters (fn [stmt params]
-                                                                      (sql-jdbc.execute/set-parameters! driver stmt params))})
+        ;; Raw `.execute` rather than `jdbc/execute!` for two reasons: pgjdbc's `executeUpdate` (what
+        ;; c.j.jdbc calls) rejects the result set the gateway returns for INSERT ("A result was
+        ;; returned when none was expected"), and c.j.jdbc's default wrapping transaction would never
+        ;; be COMMITted (the gateway always reports the session IDLE in ReadyForQuery, so pgjdbc
+        ;; skips sending COMMIT) — the inserted rows would be silently rolled back on close.
+        (with-open [stmt (.prepareStatement conn ^String sql)]
+          (when (seq params)
+            (sql-jdbc.execute/set-parameters! driver stmt params))
+          (.execute stmt))
         (catch Throwable e
           (throw (ex-info (format "INSERT FAILED: %s" (ex-message e))
-                          {:driver driver, :sql (first sql-args)}
+                          {:driver driver, :sql sql}
                           e)))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+

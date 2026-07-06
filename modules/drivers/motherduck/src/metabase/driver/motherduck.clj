@@ -264,15 +264,27 @@
 ;;; |                                              Query processing                                                   |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; A literal text expression (e.g. `[:value "foo" {:base_type :type/Text}]` in `:fields`/`:expressions`)
-;; compiles to a bare parameter placeholder — `SELECT ? AS "foo"`. MotherDuck's Postgres gateway can't
-;; deduce a result column's type from an untyped parameter and rejects the prepared statement with
-;; "ambiguous result column types". An explicit CAST gives it the type it needs. (Numbers and booleans
-;; get inlined upstream, so only string literals reach here — same fix as Redshift/Vertica.)
-(defmethod sql.qp/->honeysql [:motherduck ::sql.qp/expression-literal-text-value]
-  [driver [_ value]]
-  (->> (sql.qp/->honeysql driver value)
-       (h2x/cast :text)))
+;; A string literal compiles to a bare parameter placeholder (`?`). MotherDuck's Postgres gateway
+;; can't deduce types involving an untyped parameter and rejects the prepared statement with
+;; "ambiguous result column types" whenever one determines a result column's type — a literal text
+;; expression (`SELECT ? AS "foo"`), a `CASE ... THEN ?` branch, a `CONCAT(col, ?)` arg, etc. An
+;; explicit CAST gives the gateway the type it needs (the narrow `::sql.qp/expression-literal-text-value`
+;; fix Redshift/Vertica use is subsumed by this: that clause compiles down to a plain string too, but
+;; alone it misses strings that reach `->honeysql` un-wrapped, e.g. `:case`/`:day-name` values).
+;; Numbers and booleans get inlined upstream, so strings are the only ambiguous literals left.
+(defmethod sql.qp/->honeysql [:motherduck String]
+  [_driver s]
+  (h2x/cast :text s))
+
+;; Postgres compiles `:regex-match-first` to `substring(expr FROM pattern)` — a Postgres-only
+;; two-arg POSIX-regex overload of `substring`. DuckDB's `substring` has no such overload (only
+;; positional `substring(str, start[, len])`), so it silently tries to coerce the pattern string to
+;; an integer position and fails. Same fix as the DuckDB community driver
+;; (`modules/drivers/duckdb/src/metabase/driver/duckdb.clj`): DuckDB's native `regexp_extract`
+;; (default group 0 = whole match) is the direct equivalent.
+(defmethod sql.qp/->honeysql [:motherduck :regex-match-first]
+  [driver [_ arg pattern]]
+  [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
 
 ;; The Postgres implementations of these two methods delegate to `h2x` helpers that dispatch on the
 ;; *db-type keyword* using the global hierarchy, which knows nothing about driver parentage — so they
