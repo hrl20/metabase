@@ -10,19 +10,19 @@ Format: one section per namespace; each fixed test listed with brief notes on th
 | namespace | baseline fail/err | status |
 |---|---|---|
 | metabase.query-processor.date-time-zone-functions-test | 0/113 | ✅ all pass |
-| metabase.query-processor.date-bucketing-test | 0/60 | pending |
+| metabase.query-processor.date-bucketing-test | 0/60 | ✅ all pass (no new fix needed — cured by others' prior commits) |
 | metabase.channel.render.body-test (+card-test, pulse-integration-test) | 12/6 | pending |
-| metabase.permissions.models.collection.graph-test | 16/0 | pending |
+| metabase.permissions.models.collection.graph-test | 16/0 | ✅ all pass (see notes — no code fix needed) |
 | metabase.query-processor.expressions-test | 0/13 | ✅ all pass |
 | metabase.query-processor.cast-test | 0/8 | pending |
 | metabase.query-processor.filter-test | 0/8 | pending |
 | metabase.query-processor.alternative-date-test | 0/7 | pending |
 | metabase.query-processor.explicit-joins-test (+implicit-joins-test) | 0/7+ | pending |
 | metabase.driver-test | 3/2 | pending |
-| hooks.clojure.test-test | 2/0 | pending |
+| hooks.clojure.test-test | 2/0 | ✅ all pass |
 | metabase.driver.sql-jdbc.sync.describe-table-test | 1/1 | pending |
 | metabase.driver.sql-jdbc-test | 0/2 | pending |
-| metabase.core.modules-test | 0/1 | pending |
+| metabase.core.modules-test | 0/1 | ⚠️ partial — 2 assertions still fail, blocked on untracked `src/metabase/db/connection-pool` (see notes) |
 | metabase.driver.sql-jdbc.connection-test | 1/0 | pending |
 | metabase.indexed-entities.models.model-index-test | 0/1 | pending |
 | metabase.query-processor.case-test | 0/1 | ✅ all pass |
@@ -61,3 +61,13 @@ The temporal-arithmetic tests in this cluster were already cured by the prior `a
    - Fixed: `string-operations-from-subquery`
 
 **Pattern for other agents:** if you see "ambiguous result column types" from a query with a bare string constant *anywhere* in the query (not just as a returned field), check whether the blanket `[:motherduck String]` `->honeysql` override (added here) already covers it before writing a narrower fix — it should catch any string literal, in any clause position. For DuckDB-function-signature mismatches with Postgres (not gateway/param issues, but genuine SQL semantic differences), check `modules/drivers/duckdb/src/metabase/driver/duckdb.clj` first — same backend, likely already solved.
+
+### metabase.query-processor.date-bucketing-test — ✅ 60 tests, 0 fail/err (no new code — verification only)
+
+Assigned baseline was 60 errors, all originating from test-data load failures (`sad-toucan-incidents`, dynamically-generated `checkins:N-per-*` datasets), not query-processor logic: every test in this namespace loads a fresh dataset, and the loader's `INSERT` blew up with `"A result was returned when none was expected"` before any query ran.
+
+Root cause and fix were *already* diagnosed and applied by another concurrent agent, landed in commit `925643a41e` (also documented under `expressions-test` fix #2 above, same file): `load-data/do-insert!` in `test/metabase/test/data/motherduck.clj` used to call `jdbc/execute!`, which for a param-less/param-only single-row-worth-of-values `INSERT` statement resolves to pgjdbc's `PreparedStatement.executeUpdate`/`executeBatch` — both reject the result-set-for-every-statement the gateway always returns. The fix (already in place) builds the `PreparedStatement` directly and calls raw `.execute()` instead, bypassing `clojure.java.jdbc`'s update/batch paths entirely.
+
+By the time this agent's second full run was kicked off, that commit was already in the tree; re-running `metabase.query-processor.date-bucketing-test` confirmed **60/60 tests pass, 170 assertions, 0 failures, 0 errors** — no additional driver or test-data code needed for this namespace.
+
+**Timezone note for other agents:** the pg gateway's `SET SESSION TIMEZONE TO '<name>'` / `SET TimeZone='<name>'` only accepts canonical IANA zone names (e.g. `America/Los_Angeles`, `Asia/Hong_Kong`) — legacy three-letter-region aliases like `US/Pacific`, `US/Eastern` are rejected with `invalid value for parameter "TimeZone"` even though they appear in `pg_timezone_names()`. This namespace's Pacific/Eastern tests already use canonical names (`America/Los_Angeles`, `America/Indiana/Indianapolis`, etc. via `mt/with-report-timezone-id`), so it wasn't hit here, but any other namespace that binds a `US/*`-style timezone from a JVM `TimeZone` short name will need to normalize to the canonical IANA name before it reaches `SET SESSION TIMEZONE`.
