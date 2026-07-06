@@ -191,3 +191,19 @@ Result: **24 tests, 40 assertions, 0 failures, 0 errors** — clean. `uv run pyt
 This namespace (`metabase.permissions.models.collection.graph-test` and the `metabase.permissions.models.collection.graph` code it exercises) is plain H2 app-db logic with no `driver/*` multimethod calls and no dependency on `:motherduck` specifically — there is no plausible code path here for a driver bug to manifest. Confirms the theory already recorded above: the baseline 16 failures were collateral damage from a full-suite run (shared JVM state corruption from other namespaces' driver registration/classloading, and/or the cross-agent MotherDuck resource contention documented elsewhere in this file — e.g. the `test-data` catalog being dropped/recreated mid-run by concurrent agents), not a real defect in this namespace or the driver.
 
 **No code changes made.** No `.clj` files touched; only this FIXES.md entry.
+
+### metabase.sync.sync-metadata.sync-database-type-test — ✅ 2 tests, 8 assertions, 0 fail/err (no code fix needed)
+
+**Assigned baseline:** 6 failed assertions across `update-base-type-test` (x4) and `update-database-type-test` (x2) from a full-suite run.
+
+Ran the namespace standalone twice for determinism:
+
+```
+DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.sync.sync-metadata.sync-database-type-test
+```
+
+Both runs: **2 tests, 8 assertions, 0 failures, 0 errors.** `uv run python3 bin/junit-report.py --test 'sync-database-type-test'` found no failing/erroring test in `target/junit` for either run.
+
+Both deftests (`update-database-type-test`, `update-base-type-test`) exercise `sync-database-type`/`sync-and-update-fields-base-type!` end-to-end against a real synced table/fields using `mt/dataset` + `mt/with-temp-copy-of-db`, hitting normal `describe-fields`/type-mapping code paths — nothing unusual is being tested here relative to the many other `metabase.sync.*` namespaces that already pass. Given the namespace is now fully clean and reproducible on repeat runs, the assigned baseline's 6 failing assertions are almost certainly the same class of full-suite collateral damage already documented above for `permissions.models.collection.graph-test` and `explicit-joins-test` (shared JVM state from other namespaces' driver registration during a from-broken-state full run, and/or a MotherDuck-account-level `test-data` catalog getting dropped/recreated mid-run by other concurrently-running agents) — not a defect in this namespace or in `metabase.driver.motherduck`. By the time this agent ran, prior agents had already landed the `add-interval-honeysql-form`/`current-datetime-honeysql-form` h2x-dispatch fixes, the blanket `[:motherduck String]` cast, and the byte/string temporal-coercion fixes, any of which plausibly could have been implicated in a stale baseline.
+
+**No code changes made.** No `.clj` files touched; only this FIXES.md entry.
