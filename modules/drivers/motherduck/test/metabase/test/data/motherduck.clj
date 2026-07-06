@@ -134,6 +134,24 @@
                              :type/Integer        "INTEGER"
                              :type/Text           "STRING"
                              :type/Time           "TIME"
+                             ;; `:motherduck` derives from `:postgres` in `driver/hierarchy`, and
+                             ;; Postgres explicitly maps `:type/TimeWithTZ` -> "TIME WITH TIME ZONE"
+                             ;; (a real DuckDB type, TIMETZ). Without an override here, dispatch for
+                             ;; these types falls through to that inherited Postgres mapping, so
+                             ;; `attempted-murders`' `time_ltz`/`time_tz` columns get created as
+                             ;; DuckDB TIMETZ. But the pg-gateway's JDBC ResultSetMetaData reports
+                             ;; those columns back as plain `Types.TIME` (not
+                             ;; `TIME_WITH_TIMEZONE`), so `read-column-thunk` uses the zone-less
+                             ;; reader and returns a bare `LocalTime`, silently dropping the offset —
+                             ;; a gateway type-fidelity gap, not something fixable on the read side.
+                             ;; Map these to plain "TIME" (same as `:type/Time`) so the test
+                             ;; framework's `driver-distinguishes-between-base-types?` correctly
+                             ;; reports no TZ-aware TIME support here, matching actual behavior (and
+                             ;; matching the sibling community `:duckdb` driver, which never claims
+                             ;; this support either).
+                             :type/TimeWithTZ          "TIME"
+                             :type/TimeWithLocalTZ     "TIME"
+                             :type/TimeWithZoneOffset  "TIME"
                              :type/UUID           "UUID"}]
   (defmethod sql.tx/field-base-type->sql-type [:motherduck base-type] [_ _] db-type))
 
