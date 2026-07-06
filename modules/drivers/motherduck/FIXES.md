@@ -177,3 +177,17 @@ This pattern (correct in isolation and at small concurrency, wrong only under fu
 **Concurrency note for other agents:** while iterating, saw wildly fluctuating error counts (0 → 35 → 6 → 0 across successive identical runs of the same 5 namespaces) all tracing back to `"ERROR: Catalog Error: Catalog 'test-data' has been deleted"` / `"no database/share named 'test-data' found"` — the default shared test dataset name (`test-data`) getting dropped or recreated mid-run by *other concurrently-running agent processes* sharing the same MotherDuck account. This produced spurious failures in tests never assigned to this agent (`describe-fields-shared-attributes-test`, `calculated-semantic-type-test`, `describe-fields-are-sorted-test`, `database-types-fallback-test` in `describe-table-test`) that cleared up on a clean re-run with no code changes — if you see `Catalog '<db>' has been deleted` or `no database/share named '<db>' found` and your test doesn't touch connection/lifecycle logic, re-run before assuming it's a real bug. Also incidentally observed `test-ssh-tunnel-connection` (same `connection-test` namespace, *not* in this agent's assigned scope) failing (`can-connect-with-details?` → `false`) on a clean run — left untouched since it wasn't part of the assigned baseline; flagging for whoever owns SSH-tunnel support.
 
 **Pattern for other agents:** if your assigned namespace fails only on a full-namespace run with *numerically plausible but wrong* aggregate values (not exceptions), and passes standalone and in small concurrent batches, don't assume a SQL bug — verify the native SQL is correct first, then just re-run the full namespace once or twice before spending time on a driver fix. This namespace's failures did not reproduce on a second clean run.
+
+### 2026-07-05 re-verify: metabase.permissions.models.collection.graph-test — ✅ 24 tests, 0 fail/err (still no code fix needed)
+
+Re-ran the isolation check from scratch (independent agent, no memory of the earlier run at line 75 above) against the reported baseline of 16 full-suite failures for this namespace:
+
+```
+DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.permissions.models.collection.graph-test
+```
+
+Result: **24 tests, 40 assertions, 0 failures, 0 errors** — clean. `uv run python3 bin/junit-report.py --test 'graph-test'` found no failing/erroring test in `target/junit` for this run, corroborating the clean JUnit output.
+
+This namespace (`metabase.permissions.models.collection.graph-test` and the `metabase.permissions.models.collection.graph` code it exercises) is plain H2 app-db logic with no `driver/*` multimethod calls and no dependency on `:motherduck` specifically — there is no plausible code path here for a driver bug to manifest. Confirms the theory already recorded above: the baseline 16 failures were collateral damage from a full-suite run (shared JVM state corruption from other namespaces' driver registration/classloading, and/or the cross-agent MotherDuck resource contention documented elsewhere in this file — e.g. the `test-data` catalog being dropped/recreated mid-run by concurrent agents), not a real defect in this namespace or the driver.
+
+**No code changes made.** No `.clj` files touched; only this FIXES.md entry.
