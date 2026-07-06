@@ -15,8 +15,10 @@
    [metabase.driver :as driver]
    ;; ensure the parent driver is loaded before we register against it
    metabase.driver.postgres
+   [metabase.driver.sql-jdbc :as sql-jdbc]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
+   [metabase.driver.sql-jdbc.quoting :as sql-jdbc.quoting]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor.util :as sql.qp.u]
@@ -25,7 +27,7 @@
    [metabase.util.date-2 :as u.date]
    [metabase.util.honey-sql-2 :as h2x])
   (:import
-   (java.sql ResultSet Types)))
+   (java.sql Connection ResultSet Types)))
 
 (set! *warn-on-reflection* true)
 
@@ -50,6 +52,15 @@
   ;; when no explicit ssl-mode is set; we set it explicitly here to be unambiguous.
   (-> (sql-jdbc.conn/connection-details->spec :postgres (assoc details :ssl true))
       (assoc :sslmode "require")))
+
+;; Real Postgres signals "table does not exist" with SQLSTATE `42P01`; the Postgres impl of
+;; `impl-table-known-to-not-exist?` checks for exactly that. MotherDuck's gateway forwards DuckDB's own
+;; "Catalog Error" for the same condition without that SQLSTATE, so the Postgres check never matches and
+;; the exception propagates instead of `driver/table-exists?` returning `false`. Match on the DuckDB
+;; catalog error text instead.
+(defmethod sql-jdbc/impl-table-known-to-not-exist? :motherduck
+  [_driver e]
+  (boolean (re-find #"(?i)catalog error.*does not exist" (or (.getMessage ^java.sql.SQLException e) ""))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Feature flags                                                      |
@@ -391,3 +402,89 @@
   [_driver ^ResultSet rs _rsmeta ^Integer i]
   (fn []
     (some-> (.getString rs i) parse-array-literal)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                          Driver-managed table DDL                                                |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; The `:sql-jdbc` default impls of `create-table!`/`drop-table!`/`insert-into!`/`rename-tables!*` run their SQL
+;; through `clojure.java.jdbc`, which calls pgjdbc's `executeUpdate`/`executeBatch` -- both reject the result set
+;; MotherDuck's gateway returns for *every* statement, DDL included (see AGENTS.md). Re-implemented here with a
+;; raw `Statement`/`PreparedStatement` and `.execute()`, which permits (and ignores) the returned result set --
+;; same fix already applied to the test-data loader's `execute-sql!`/`do-insert!`
+;; (`test/metabase/test/data/motherduck.clj`), needed again here because these are separate multimethods
+;; (driver-managed table actions used e.g. by `driver.sql-jdbc-test`, not test-data loading).
+(defn- raw-execute!
+  "Run `sql` (a single statement, no params) against `db-or-id` via a raw `Statement.execute`."
+  [driver db-or-id sql]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver db-or-id {:write? true}
+   (fn [^Connection conn]
+     (with-open [stmt (.createStatement conn)]
+       (.execute stmt ^String sql)))))
+
+(defmethod driver/create-table! :motherduck
+  [driver database-id table-name column-definitions & {:keys [primary-key]}]
+  (raw-execute!
+   driver database-id
+   (sql-jdbc.quoting/with-quoting driver
+     (first (sql/format {:create-table (sql-jdbc.quoting/quote-table table-name)
+                         :with-columns (cond-> (mapv (fn [[col-name type-spec]]
+                                                       (vec (cons (sql-jdbc.quoting/quote-identifier col-name)
+                                                                  (if (string? type-spec)
+                                                                    [[:raw type-spec]]
+                                                                    type-spec))))
+                                                     column-definitions)
+                                         primary-key (conj [(into [:primary-key] primary-key)]))}
+                        :quoted true
+                        :dialect (sql.qp/quote-style driver))))))
+
+(defmethod driver/drop-table! :motherduck
+  [driver db-id table-name]
+  (raw-execute!
+   driver db-id
+   (first (sql/format {:drop-table [:if-exists (keyword table-name)]}
+                      :quoted true
+                      :dialect (sql.qp/quote-style driver)))))
+
+(defmethod driver/insert-into! :motherduck
+  [driver db-id table-name column-names values]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver db-id {:write? true}
+   (fn [^Connection conn]
+     (doseq [chunk (partition-all (or driver/*insert-chunk-rows* 100) values)
+             :let  [[sql & params] (sql/format {:insert-into (keyword table-name)
+                                                :columns     (sql-jdbc.quoting/quote-columns driver column-names)
+                                                :values      chunk}
+                                               :quoted true
+                                               :dialect (sql.qp/quote-style driver))]]
+       (with-open [stmt (.prepareStatement conn ^String sql)]
+         (when (seq params)
+           (sql-jdbc.execute/set-parameters! driver stmt params))
+         (.execute stmt))))))
+
+;; DuckDB does support multi-statement transactions, but the pg gateway always reports the connection as
+;; IDLE (see AGENTS.md), so pgjdbc's own `Connection.commit()`/`.rollback()` machinery can't be trusted to
+;; send anything. Sidestep that entirely by sending literal `BEGIN`/`COMMIT`/`ROLLBACK` SQL text over a plain
+;; autocommit connection -- the gateway/DuckDB treat those as ordinary statements, not JDBC transaction API
+;; calls, so they always go out on the wire.
+(defmethod driver/rename-tables!* :motherduck
+  [driver db-id sorted-rename-map]
+  (let [sqls (mapv (fn [[from-table to-table]]
+                     (first (sql/format {:alter-table  (keyword from-table)
+                                         :rename-table (keyword (name to-table))}
+                                        :quoted true
+                                        :dialect (sql.qp/quote-style driver))))
+                   sorted-rename-map)]
+    (sql-jdbc.execute/do-with-connection-with-options
+     driver db-id {:write? true}
+     (fn [^Connection conn]
+       (with-open [stmt (.createStatement conn)]
+         (.execute stmt "BEGIN;")
+         (try
+           (doseq [sql sqls]
+             (.execute stmt ^String sql))
+           (.execute stmt "COMMIT;")
+           (catch Throwable e
+             (.execute stmt "ROLLBACK;")
+             (throw e))))))))

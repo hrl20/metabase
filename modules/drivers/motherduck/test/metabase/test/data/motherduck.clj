@@ -12,6 +12,7 @@
    [clojure.string :as str]
    [metabase.config.core :as config]
    [metabase.driver :as driver]
+   [metabase.driver.sql-jdbc.connection-test :as connection-test]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync.describe-table-test :as describe-table-test]
    [metabase.test :as mt]
@@ -20,7 +21,8 @@
    [metabase.test.data.sql-jdbc.execute :as execute]
    [metabase.test.data.sql-jdbc.load-data :as load-data]
    [metabase.test.data.sql-jdbc.spec :as spec]
-   [metabase.test.data.sql.ddl :as ddl])
+   [metabase.test.data.sql.ddl :as ddl]
+   [metabase.util.random :as u.random])
   (:import
    (java.sql Connection)))
 
@@ -40,12 +42,21 @@
                               ;; loader can't create FKs). Same situation as `:mongo`/`:sqlite`; the
                               ;; `::describe-pks` proxy otherwise infers false from key-constraints.
                               ::describe-table-test/describe-pks true
-                              :test/cannot-destroy-db true}]
+                              :test/cannot-destroy-db true
+                              ;; The gateway authenticates with the token as the password; `:user` is
+                              ;; cosmetic (see `dbdef->connection-details` above) and isn't checked, so
+                              ;; corrupting only `:user` (as `test-bad-connection-detail-acquisition`
+                              ;; does) can't break the connection. Same situation as `:hive-like`.
+                              ::connection-test/regular-connection-pooling false}]
   (defmethod driver/database-supports? [:motherduck feature] [_driver _feature _db] supported?))
 
+;; The gateway ignores unknown detail keys (`{:unknown_config "single"}`, the stock stub other test
+;; extensions use, doesn't break anything here), but it always requires `:dbname` to name a database
+;; that exists (see `dbdef->connection-details` above) — so pointing it at one that doesn't reliably
+;; fails the connection.
 (defmethod tx/bad-connection-details :motherduck
   [_driver]
-  {:unknown_config "single"})
+  {:dbname (u.random/random-name)})
 
 ;; Inherited from `:postgres`, but that impl hardcodes the `public` schema; DuckDB/MotherDuck puts
 ;; user tables in `main`.
@@ -150,6 +161,12 @@
 ;; constraints (matches `:metadata/key-constraints false` in the driver).
 (defmethod sql.tx/add-fk-sql :motherduck [& _] nil)
 
+;; Inherited from `:postgres` as "GENERATED ALWAYS AS (%s) STORED", but DuckDB only supports VIRTUAL
+;; generated columns (the default when `STORED`/`VIRTUAL` is omitted) — `STORED` errors with "Can not
+;; create a STORED generated column!". Same expression `sql.tx/generated-column-sql :default` uses.
+(defmethod sql.tx/generated-column-sql :motherduck [_ expr]
+  (format "GENERATED ALWAYS AS (%s)" expr))
+
 (defmethod load-data/row-xform :motherduck
   [_driver _dbdef tabledef]
   (load-data/maybe-add-ids-xform tabledef))
@@ -202,6 +219,23 @@
           (throw (ex-info (format "INSERT FAILED: %s" (ex-message e))
                           {:driver driver, :sql sql}
                           e)))))))
+
+;; The stock `:sql-jdbc/test-extensions` impls run `CREATE VIEW`/`DROP VIEW` via `jdbc/execute!`,
+;; subject to the same "result set returned for every statement" issue as `execute-sql!` above.
+;; Reuse the same SQL builders, but execute via the raw-`.execute` `execute-sql!` override.
+(defmethod tx/create-view-of-table! :motherduck
+  [driver database view-name table-name options]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver database {:write? true}
+   (fn [conn]
+     (execute/execute-sql! driver conn (first (sql.tx/create-view-of-table-sql driver database view-name table-name options))))))
+
+(defmethod tx/drop-view! :motherduck
+  [driver database view-name options]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver database {:write? true}
+   (fn [conn]
+     (execute/execute-sql! driver conn (first (sql.tx/drop-view-sql driver database view-name options))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                      create / load / cleanup lifecycle                                          |
