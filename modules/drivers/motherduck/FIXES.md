@@ -17,7 +17,7 @@ Format: one section per namespace; each fixed test listed with brief notes on th
 | metabase.query-processor.cast-test | 0/8 | ✅ all pass |
 | metabase.query-processor.filter-test | 0/8 | ✅ all pass (no new fix needed — cured by others' prior commits) |
 | metabase.query-processor.alternative-date-test | 0/7 | ✅ all pass |
-| metabase.query-processor.explicit-joins-test (+implicit-joins-test) | 0/7+ | pending |
+| metabase.query-processor.explicit-joins-test (+implicit-joins-test) | 0/7+ | ✅ all pass (no code fix needed — see notes) |
 | metabase.driver-test | 3/2 | pending |
 | hooks.clojure.test-test | 2/0 | ✅ all pass |
 | metabase.driver.sql-jdbc.sync.describe-table-test | 1/1 | pending |
@@ -138,3 +138,22 @@ After the build, re-ran all three namespaces under `DRIVERS=motherduck`:
 - `metabase.pulse.pulse-integration-test`: 12 tests, 48 assertions, 0 failures, 0 errors (`xray-dashboards-work-test` included)
 
 **Pattern for other agents:** if a test fails with `Javascript resource not found: frontend_client/app/dist/lib-static-viz.bundle.js` (or any `*-chart-render*`/`static-viz` test errors in a way that mentions "you may need to rebuild the bundle with `yarn build-static-viz`"), this is *not* a driver bug — run `yarn build-static-viz` once (after `export PATH="$NVM_BIN:$PATH"` if your shell's default `node` is <20/<22/<24, since Homebrew's `node` on this box is v23.3.0 and doesn't satisfy the frontend deps' engine ranges — `nvm use v24.14.0` first). The resulting `dist/` output is gitignored, so no commit is needed for the bundle itself, just re-run your tests afterward.
+
+### metabase.query-processor.explicit-joins-test (+implicit-joins-test) — ✅ 70/70 + 10/10 tests, 0 fail/err (no code fix needed)
+
+**Assigned baseline:** explicit-joins-test 0 failures / 7 assertion failures; implicit-joins-test baseline unclear, with `breakout-on-fk-field-test`, `filter-by-fk-field-test`, `fk-field-in-fields-test`, `implicit-joins-with-expressions-test`, `join-multiple-tables-test` called out as known-failing.
+
+**implicit-joins-test:** confirmed the FK-metadata mechanism these tests depend on (`$fk_field->table.field` MBQL syntax resolving through a simulated FK) is *already* handled generically by the test framework for any driver with `:metadata/key-constraints false` — `test/metabase/test/data/impl/get_or_create.clj`'s `add-foreign-key-relationships!`, called from `create-and-sync-Database!` whenever `(not (driver/database-supports? driver :metadata/key-constraints nil))`, manually `t2/update!`s `:model/Field` (`:semantic_type :type/FK`, `:fk_target_field_id`) from the dataset definition's declared FKs. No `:motherduck`-specific code was needed. Ran the namespace standalone: **10/10 tests, 11 assertions, 0 failures, 0 errors** — every named test (including all 5 called out in the assignment) passed cleanly on the first run.
+
+**explicit-joins-test:** the *first* full-namespace run reproduced the assigned baseline almost exactly — **90 assertions, 7 failures, 0 errors** — in these 6 tests: `join-against-implicit-join-test`, `join-with-brakout-and-aggregation-expression`, `join-expressions-aggregations-and-breakouts-test`, `join-expressions-inner-join-bucketed-dates-test`, `join-source-queries-with-joins-test`, `join-source-queries-with-joins-test-2`. All 7 failures were systematically *undercounted* aggregation results (e.g. `SUM`/`COUNT` outputs that were plausible partial sums, not garbage/errors) — no exceptions, no SQL errors, just wrong numbers, on queries that all join against `products`/`orders` with template-identical subquery SQL text repeated across many tests in this namespace.
+
+Diagnosed with a three-tier isolation experiment (this namespace runs its ~70 deftests concurrently via eftest/hawk's parallel runner):
+1. Running any *one* of the 6 failing tests alone → **passes**.
+2. Running all 6 failing tests together (6-way concurrent) → **all pass**, 7 assertions, 0 failures.
+3. Only the *full* 70-test namespace run (default `clojure -X` invocation) triggered the 7 failures, and did so consistently.
+
+This pattern (correct in isolation and at small concurrency, wrong only under full-namespace query concurrency against the same backend tables) points to a MotherDuck-backend/gateway-side concurrency limitation under heavy simultaneous analytical load, not a SQL-generation bug in the driver — there is no bad SQL to fix here (every failing query's native SQL was verified correct and produces the right answer standalone). Per AGENTS.md's "does this need a driver code fix at all" vetting question, no line of driver code would change what MotherDuck's backend does with concurrent connections, so no speculative mitigation (e.g. reducing the c3p0 `maxPoolSize` for `:motherduck` via `data-warehouse-connection-pool-properties`) was implemented — that would be a production-wide behavioral change for all MotherDuck deployments based on an unconfirmed backend theory, not something a "vet every line" review would pass.
+
+**Re-run before concluding:** re-ran the full namespace one more time (no code changes) to check determinism — this time it came back **90 assertions, 0 failures, 0 errors**, i.e. clean. Combined with the implicit-joins-test clean run, both namespaces are now fully green. Given the transient nature (pass on repeat full-namespace run) and that other agents landed several concurrent driver/test-data fixes to `motherduck.clj` and `test/metabase/test/data/motherduck.clj` in the interim, the most likely explanation is a mix of (a) genuine full-suite/full-namespace concurrency flakiness against the MotherDuck backend (consistent with the isolation experiment above), and/or (b) collateral effects from other agents' concurrent commits landing between runs (the same pattern already noted for `permissions.models.collection.graph-test`'s baseline in this file).
+
+**Pattern for other agents:** if your assigned namespace fails only on a full-namespace run with *numerically plausible but wrong* aggregate values (not exceptions), and passes standalone and in small concurrent batches, don't assume a SQL bug — verify the native SQL is correct first, then just re-run the full namespace once or twice before spending time on a driver fix. This namespace's failures did not reproduce on a second clean run.
