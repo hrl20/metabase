@@ -870,8 +870,11 @@
            events
            lib
            lib-be
+           models
            premium-features
+           public-settings
            query-processor
+           secrets
            settings
            sql-tools
            system
@@ -1424,6 +1427,7 @@
            metabase.models.init
            metabase.models.interface
            metabase.models.resolution
+           metabase.models.secret
            metabase.models.serialization
            metabase.models.serialization.resolve
            metabase.models.serialization.resolve.mp

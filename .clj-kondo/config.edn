@@ -255,6 +255,7 @@
               :sqlserver
               :starburst
               :vertica
+              :duckdb
               :motherduck}}
 
   ;;
