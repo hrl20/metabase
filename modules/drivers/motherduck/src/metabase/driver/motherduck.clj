@@ -19,7 +19,10 @@
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.driver.sql.query-processor.util :as sql.qp.u]
+   [metabase.driver.sql.util :as sql.u]
    [metabase.util :as u]
+   [metabase.util.date-2 :as u.date]
    [metabase.util.honey-sql-2 :as h2x])
   (:import
    (java.sql ResultSet Types)))
@@ -270,6 +273,37 @@
   [driver [_ value]]
   (->> (sql.qp/->honeysql driver value)
        (h2x/cast :text)))
+
+;; The Postgres implementations of these two methods delegate to `h2x` helpers that dispatch on the
+;; *db-type keyword* using the global hierarchy, which knows nothing about driver parentage — so they
+;; blow up on `:motherduck`. DuckDB understands the same `now()` / `expr + INTERVAL 'n unit'` SQL that
+;; those helpers emit for Postgres, so delegate with an explicit `:postgres` db-type.
+(defmethod sql.qp/current-datetime-honeysql-form :motherduck
+  [_driver]
+  (h2x/current-datetime-honeysql-form :postgres))
+
+(defmethod sql.qp/add-interval-honeysql-form :motherduck
+  [_driver hsql-form amount unit]
+  (h2x/add-interval-honeysql-form :postgres hsql-form amount unit))
+
+;; Same as the Postgres implementation except everything that would compile to a bare `?` param is
+;; given a concrete type: `TIMEZONE(?, ?)` makes the result column type ambiguous to MotherDuck's
+;; gateway and the prepared statement is rejected. Timezone names are rendered as inline string
+;; literals (what non-parameterized drivers, e.g. Snowflake/Athena, do here anyway) and a literal
+;; datetime arg gets a TIMESTAMP cast (`->pg-timestamp` is a no-op for already-typed columns).
+(defmethod sql.qp/->honeysql [:motherduck :convert-timezone]
+  [driver [_ arg target-timezone source-timezone]]
+  (let [expr         (sql.qp/->honeysql driver (cond-> arg
+                                                 (string? arg) u.date/parse))
+        timestamptz? (or (sql.qp.u/field-with-tz? arg)
+                         (h2x/is-of-type? expr "timestamptz")
+                         (h2x/is-of-type? expr "timestamp with time zone"))
+        _            (sql.u/validate-convert-timezone-args timestamptz? target-timezone source-timezone)
+        expr         [:timezone (h2x/literal target-timezone)
+                      (if-not timestamptz?
+                        [:timezone (h2x/literal source-timezone) (h2x/->pg-timestamp expr)]
+                        expr)]]
+    (h2x/with-database-type-info expr "timestamp")))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Result reading                                                     |
