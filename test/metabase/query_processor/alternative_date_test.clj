@@ -406,6 +406,7 @@
              {:field-name "as_bytes"
               :base-type {:natives {:postgres "BYTEA"
                                     :h2       "BYTEA"
+                                    :motherduck "BLOB"
                                     :mysql    "VARBINARY(100)"
                                     :redshift "VARBYTE"
                                     :presto-jdbc "VARBINARY"
@@ -451,7 +452,7 @@
      [2 "bar" (OffsetDateTime/from #t "2020-04-21T16:43Z")]
      [3 "baz" (OffsetDateTime/from #t "2021-04-21T16:43Z")]]))
 
-(doseq [driver [:mysql :sqlserver :presto-jdbc]]
+(doseq [driver [:mysql :sqlserver :presto-jdbc :motherduck]]
   (defmethod yyyymmddhhmmss-binary-dates-expected-rows driver
     [_driver]
     [[1 "foo" #t "2019-04-21T16:43"]
@@ -504,7 +505,7 @@
    [2 "bar" (.toInstant #t "2020-04-21T16:43:00Z")]
    [3 "baz" (.toInstant #t "2021-04-21T16:43:00Z")]])
 
-(doseq [driver [:mysql :sqlserver :bigquery-cloud-sdk :snowflake :vertica :presto-jdbc :starburst :athena]]
+(doseq [driver [:mysql :sqlserver :bigquery-cloud-sdk :snowflake :vertica :presto-jdbc :starburst :athena :motherduck]]
   (defmethod yyyymmddhhmmss-dates-expected-rows driver
     [_driver]
     [[1 "foo" #t "2019-04-21T16:43"]
@@ -566,6 +567,7 @@
              {:field-name "as_bytes"
               :base-type {:natives {:postgres "BYTEA"
                                     :h2       "BYTEA"
+                                    :motherduck "BLOB"
                                     :mysql    "VARBINARY(100)"
                                     :redshift "VARBYTE"
                                     :presto-jdbc "VARBINARY"
@@ -594,7 +596,7 @@
      [2 "bar" (OffsetDateTime/from #t "2020-04-21T16:43Z")]
      [3 "baz" (OffsetDateTime/from #t "2021-04-21T16:43Z")]]))
 
-(doseq [driver [:mysql :sqlserver :presto-jdbc :postgres :h2]]
+(doseq [driver [:mysql :sqlserver :presto-jdbc :postgres :h2 :motherduck]]
   (defmethod binary-dates-expected-rows-iso driver
     [_driver]
     [[1 "foo" #t "2019-04-21T16:43"]

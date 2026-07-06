@@ -286,6 +286,29 @@
   [driver [_ arg pattern]]
   [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
 
+;; Postgres parses a `YYYYMMDDHH24MISS`-formatted string with the 2-arg `to_timestamp(text, text)`
+;; format-string overload; DuckDB's `to_timestamp` only has a 1-arg `(double) -> timestamptz` (Unix
+;; epoch) overload, so the inherited Postgres impl 404s ("No function matches ... to_timestamp(STRING,
+;; STRING)"). DuckDB's own string-with-format parser is `strptime`, using strftime-style `%`
+;; directives; unlike Postgres's `to_timestamp`, it returns a plain `timestamp` with no zone attached
+;; (no zone info was ever present in the source string), so this is tagged "timestamp" rather than
+;; "timestamptz" — see the matching `:motherduck` entries alongside `:mysql`/`:sqlserver`/`:presto-jdbc`
+;; (also zone-less) in the affected tests.
+(defmethod sql.qp/cast-temporal-string [:motherduck :Coercion/YYYYMMDDHHMMSSString->Temporal]
+  [_driver _coercion-strategy expr]
+  (h2x/with-database-type-info [:strptime expr (h2x/literal "%Y%m%d%H%M%S")] "timestamp"))
+
+;; Postgres casts a BYTEA column to text with `convert_from(expr, 'UTF8')`; DuckDB has no
+;; `convert_from` (it errors "Scalar Function with name convert_from does not exist"). DuckDB's own
+;; BLOB->VARCHAR decoder is `decode`, which assumes UTF8 same as Postgres's call here.
+(defmethod sql.qp/cast-temporal-byte [:motherduck :Coercion/YYYYMMDDHHMMSSBytes->Temporal]
+  [driver _coercion-strategy expr]
+  (sql.qp/cast-temporal-string driver :Coercion/YYYYMMDDHHMMSSString->Temporal [:decode expr]))
+
+(defmethod sql.qp/cast-temporal-byte [:motherduck :Coercion/ISO8601Bytes->Temporal]
+  [driver _coercion-strategy expr]
+  (sql.qp/cast-temporal-string driver :Coercion/ISO8601->DateTime [:decode expr]))
+
 ;; The Postgres implementations of these two methods delegate to `h2x` helpers that dispatch on the
 ;; *db-type keyword* using the global hierarchy, which knows nothing about driver parentage — so they
 ;; blow up on `:motherduck`. DuckDB understands the same `now()` / `expr + INTERVAL 'n unit'` SQL that
