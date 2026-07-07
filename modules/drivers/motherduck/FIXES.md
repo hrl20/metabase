@@ -340,3 +340,14 @@ Add #{metabase.connection-pool} to [connection-pool :api]  (used by metabase.con
 ```
 
 Confirmed `src/metabase/db/connection-pool/` is still present, untracked, and unchanged (`git status --porcelain` shows only `?? src/metabase/db/` and `?? modules/drivers/duckdb/`, nothing else touching this area) — so this is exactly the same blocker as before, not a new regression from the concurrent `duckdb/` classpath fix. No code changes made; not touching `src/metabase/db/connection-pool/` per the standing constraint. Still blocked, as previously documented — stopping here.
+
+### 2026-07-06 (later same day) — metabase.core.modules-test — third re-check: still blocked, `connection-pool` clone untouched
+
+Assigned this exact test/failure pair again (`Add #{connection-pool} to [connection-pool-test :uses]` / `Add #{metabase.connection-pool} to [connection-pool :api]`). Verified from scratch, independent of the two prior entries above:
+
+1. `git status --short` still shows only `?? src/metabase/db/` for this area (plus unrelated untracked scratch/data dirs elsewhere in the tree — `data/`, `ducklake/`, `test.db`, etc. — none of which touch `src/metabase/db` or `.clj-kondo/`). `ls -la src/metabase/db/connection-pool/` confirms it's still the same nested clone: its own `.git` file, `.circleci`, `project.clj`, `src/`, `test/`, `target/` — byte-identical layout to what the prior two entries described. Not tracked, not moved, not deleted, not `.gitignore`d.
+2. Re-ran standalone: `DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.core.modules-test`, then `uv run python3 bin/junit-report.py --test 'modules-test'`. Result: **2 failures, 0 errors** in `metabase.core.modules-test`, both assertions byte-for-byte identical to the ones documented above (same "Add #{connection-pool} to [connection-pool-test :uses]" / "Add #{metabase.connection-pool} to [connection-pool :api]" diff from `dev.deps-graph/print-kondo-config-diff`).
+
+Same root cause as both prior entries: `dev.deps-graph/dependencies` scans the untracked `src/metabase/db/connection-pool/` nested clone as real Metabase source (it sits under `src/`), computing real `:api`/`:uses` for the `connection-pool`/`connection-pool-test` "modules" that `.clj-kondo/config/modules/config.edn` deliberately omits (that module is normally an external Maven jar per root `deps.edn`, not local source — `dev.deps-graph/kondo-config` explicitly `dissoc`s it with a comment saying so). No config change can fix this without either (a) faking config entries to match the accidental local scan, which would misrepresent the real module graph, or (b) removing/relocating the stray clone from under `src/`, which the task's standing instruction explicitly forbids without stopping to ask first.
+
+**No code changes made.** Not touching `src/metabase/db/connection-pool/`. Still blocked, same as both prior check-ins — nothing has changed on this front since the last entry.
