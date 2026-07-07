@@ -286,3 +286,15 @@ This confirms the gateway can only represent a *single-dimension* Postgres array
 **Verification:** `DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.query-processor.nested-array-test` → **1 test, 1 assertion, 0 failures, 0 errors**.
 
 **Files touched:** `test/metabase/query_processor/nested_array_test.clj` (new `:motherduck` `native-nested-array-results` defmethod; core/shared test file, justified above — no `modules/drivers/motherduck/**` changes needed, since this is a genuine gateway-representation limitation rather than anything the driver's read path can influence).
+
+### 2026-07-06 — metabase.warehouses.models.database-test — ✅ 1 test, 1 assertion, 0 fail/err (no driver fix needed)
+
+**Assigned baseline:** 1 failure, `hydrate-tables-test` at `database_test.clj:610`.
+
+Ran the namespace standalone (`DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.warehouses.models.database-test`): **109 tests, 1 error, 0 failures**, and the one error was `check-health!-test` (a transient `Connection reset` / `INSERT FAILED: An I/O error occurred while sending to the backend` while loading the `people` table — a network flake against the MotherDuck pg gateway, not part of this task's assigned baseline and not touched). `hydrate-tables-test` itself passed clean in that same run (`uv run python3 bin/junit-report.py --test 'database-test'` showed no failure/error for it; parsing `target/junit/metabase.warehouses.models.database_test.xml` directly confirmed `hydrate-tables-test` has no `<failure>`/`<error>` child).
+
+Re-ran `hydrate-tables-test` alone for determinism (`DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.warehouses.models.database-test/hydrate-tables-test`) — **1 test, 1 assertion, 0 failures, 0 errors**, confirming it's not flaky/order-dependent either.
+
+**Root cause of original failure — collateral damage, not a driver defect:** the test asserts `(mt/db)` (the shared `test-data` sample database) hydrates its `:tables` to exactly `["CATEGORIES" "CHECKINS" "ORDERS" "PEOPLE" "PRODUCTS" "REVIEWS" "USERS" "VENUES"]`. This is the same kind of full-suite-only symptom documented elsewhere in this file (e.g. `explicit-joins-test`, `sync-database-type-test`): a shared `test-data` catalog getting into an unexpected state (wrong table set/count) when many namespaces run concurrently against the same MotherDuck account, rather than anything wrong with driver code. Given this session ran shortly after the `modules/drivers/duckdb/` classpath-collision fix (see the `string-extracts-test` entry above), which silently broke `:motherduck` driver registration for any run that had the stray `duckdb` module present, it's plausible the original baseline failure was recorded before that fix landed — a run with `:motherduck` mis-registered as a `:duckdb` child would produce garbage/incomplete `describe-database`/table-hydration results exactly like this.
+
+**No code changes made.** No `.clj` files touched; only this FIXES.md entry.
