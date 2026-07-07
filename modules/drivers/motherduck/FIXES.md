@@ -298,3 +298,20 @@ Re-ran `hydrate-tables-test` alone for determinism (`DRIVERS=motherduck clojure 
 **Root cause of original failure — collateral damage, not a driver defect:** the test asserts `(mt/db)` (the shared `test-data` sample database) hydrates its `:tables` to exactly `["CATEGORIES" "CHECKINS" "ORDERS" "PEOPLE" "PRODUCTS" "REVIEWS" "USERS" "VENUES"]`. This is the same kind of full-suite-only symptom documented elsewhere in this file (e.g. `explicit-joins-test`, `sync-database-type-test`): a shared `test-data` catalog getting into an unexpected state (wrong table set/count) when many namespaces run concurrently against the same MotherDuck account, rather than anything wrong with driver code. Given this session ran shortly after the `modules/drivers/duckdb/` classpath-collision fix (see the `string-extracts-test` entry above), which silently broke `:motherduck` driver registration for any run that had the stray `duckdb` module present, it's plausible the original baseline failure was recorded before that fix landed — a run with `:motherduck` mis-registered as a `:duckdb` child would produce garbage/incomplete `describe-database`/table-hydration results exactly like this.
 
 **No code changes made.** No `.clj` files touched; only this FIXES.md entry.
+
+### 2026-07-06 — metabase.xrays.automagic-dashboards.core-test — ✅ 1159 assertions, 0 fail/err (no driver fix needed)
+
+**Assigned baseline:** 1 failure, `candidates-test` at `malli_equals.cljc:17`.
+
+Ran the namespace standalone twice for determinism (`DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.xrays.automagic-dashboards.core-test`):
+
+```
+tests="1159" errors="0" failures="0"   # run 1
+tests="1159" errors="0" failures="0"   # run 2
+```
+
+`uv run python3 bin/junit-report.py --test 'candidates-test'` / `--test 'automagic-dashboards.core-test'` found no failing/erroring test in `target/junit` after either run.
+
+**Root cause — collateral damage, not a driver defect:** `candidates-test` exercises `automagic-dashboards.core/candidate-tables`, which walks every table in `(mt/db)` (the shared `test-data` sample database) and asserts against the full, exact table/field set it returns. This is the same class of full-suite-only symptom already documented several times above (`explicit-joins-test`, `sync-database-type-test`, `warehouses.models.database-test/hydrate-tables-test`): a shared `test-data` catalog getting into an unexpected/incomplete state (wrong table set, or garbage `describe-database` results) when many namespaces run concurrently against the same MotherDuck account, or — more likely given this task's timing — a stale baseline recorded before the `modules/drivers/duckdb/` classpath-collision fix landed (documented in the `string-extracts-test` entry above), which silently mis-registered `:motherduck` as a `:duckdb` child and would produce exactly this kind of wrong/incomplete table-hydration output feeding into `candidate-tables`.
+
+**No code changes made.** No `.clj` files touched; only this FIXES.md entry.
