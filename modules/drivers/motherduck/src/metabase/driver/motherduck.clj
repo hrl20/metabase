@@ -85,7 +85,16 @@
                  :metadata/key-constraints
                  :transforms/table
                  :transforms/python
-                 :transforms/index-ddl]]
+                 :transforms/index-ddl
+                 ;; DuckDB's regex engine (RE2, like BigQuery/Clickhouse/Presto/Redshift/Vertica/Athena
+                 ;; -- see their `:regex/lookaheads-and-lookbehinds false` overrides) doesn't support
+                 ;; Perl-style lookahead/lookbehind assertions. `:host`/`:domain`/`:subdomain`/`:path`
+                 ;; column extractions desugar to `regex-match-first` with hardcoded lookaround regexes
+                 ;; (`metabase.lib.filter.desugar.jvm`), which DuckDB's `regexp_extract` rejects outright:
+                 ;; "Invalid Input Error: invalid perl operator: (?<". Same root cause, same fix as the
+                 ;; other RE2-backed drivers -- this feature flag gates those tests off
+                 ;; (`mt/normal-drivers-with-feature :expressions :regex/lookaheads-and-lookbehinds`).
+                 :regex/lookaheads-and-lookbehinds]]
   (defmethod driver/database-supports? [:motherduck feature]
     [_driver _feature _db]
     false))
