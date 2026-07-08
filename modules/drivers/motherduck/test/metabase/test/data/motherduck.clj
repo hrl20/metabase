@@ -8,10 +8,9 @@
   all of the work; the overrides below cover only the places where the backend (DuckDB) differs
   from real Postgres."
   (:require
-   [clojure.java.io :as io]
-   [clojure.string :as str]
    [metabase.config.core :as config]
    [metabase.driver :as driver]
+   [metabase.driver.motherduck-test.util :as motherduck-test.util]
    [metabase.driver.sql-jdbc.connection-test :as connection-test]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync.describe-table-test :as describe-table-test]
@@ -72,29 +71,6 @@
 ;;; |                                              Connection details                                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defn- dotenv
-  "Parse simple `KEY=VALUE` lines from the repo-root `.env` into a string->string map (empty map if
-  the file is absent). The test runner's working directory is the repo root."
-  []
-  (let [f (io/file ".env")]
-    (if (.exists f)
-      (into {}
-            (for [line  (str/split-lines (slurp f))
-                  :let  [line (str/trim line)]
-                  :when (and (seq line)
-                             (not (str/starts-with? line "#"))
-                             (str/includes? line "="))
-                  :let  [[k v] (str/split line #"=" 2)]]
-              [(str/trim k) (str/trim v)]))
-      {})))
-
-(defn- motherduck-token
-  "The MotherDuck token: `MOTHERDUCK_TOKEN` env var, then a `MOTHERDUCK_TOKEN=` line in repo-root
-  `.env`. The MotherDuck pg gateway authenticates with the token as the Postgres password."
-  []
-  (or (not-empty (System/getenv "MOTHERDUCK_TOKEN"))
-      (not-empty (get (dotenv) "MOTHERDUCK_TOKEN"))))
-
 ;; Postgres-wire connection details to MotherDuck, used both by the driver-under-test and by the
 ;; test-data loader (`spec/dbdef->spec` builds JDBC specs from these via `connection-details->spec
 ;; :motherduck`). Host/port/user default to the us-east-1 endpoint and a (cosmetic) `metabase` user,
@@ -114,7 +90,7 @@
   {:host     (tx/db-test-env-var :motherduck :host "pg.us-east-1-aws.motherduck.com")
    :port     (tx/db-test-env-var :motherduck :port 5432)
    :user     (tx/db-test-env-var :motherduck :user "metabase")
-   :password (or (tx/db-test-env-var :motherduck :password) (motherduck-token))
+   :password (or (tx/db-test-env-var :motherduck :password) (motherduck-test.util/motherduck-token))
    :ssl      true
    :dbname   (if (and database-name (not= context :server))
                database-name
