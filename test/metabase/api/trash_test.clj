@@ -99,11 +99,12 @@
             (is (= "You don't have permissions to do that."
                    (mt/user-http-request :rasta :put 403 (str "pulse/" id) {:collection_id (collection/trash-collection-id)})))))))))
 
-(deftest ^:parallel cannot-move-collection-to-trash-test
+(deftest cannot-move-collection-to-trash-test
   (testing "Cannot move a a collection to the trash"
-    (let [{id :id} (mt/user-http-request :crowberto :post 200 "collection" {:name "Collection in trash"})]
-      (is (= "You don't have permissions to do that."
-             (mt/user-http-request :crowberto :put 403 (str "collection/" id) {:parent_id (collection/trash-collection-id)}))))))
+    (mt/with-model-cleanup [:model/Collection]
+      (let [{id :id} (mt/user-http-request :crowberto :post 200 "collection" {:name "Collection in trash"})]
+        (is (= "You don't have permissions to do that."
+               (mt/user-http-request :crowberto :put 403 (str "collection/" id) {:parent_id (collection/trash-collection-id)})))))))
 
 (deftest ^:parallel cannot-move-native-query-snippet-to-trash-test
   (testing "Cannot move a native query snippet to the trash"
