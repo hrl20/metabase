@@ -50,8 +50,13 @@
   ;;
   ;; Passing `:ssl true` to the Postgres `connection-details->spec` already yields `sslmode=require`
   ;; when no explicit ssl-mode is set; we set it explicitly here to be unambiguous.
+  ;;
+  ;; `options=--compatibility-mode=metabase` is forwarded to the gateway as a startup packet option
+  ;; (like `PGOPTIONS`), opting the connection into MotherDuck-gateway code paths written specifically
+  ;; for Metabase (e.g. quoting array elements the way real Postgres does).
   (-> (sql-jdbc.conn/connection-details->spec :postgres (assoc details :ssl true))
-      (assoc :sslmode "require")))
+      (assoc :sslmode "require"
+             :options "--compatibility-mode=metabase")))
 
 ;; Real Postgres signals "table does not exist" with SQLSTATE `42P01`; the Postgres impl of
 ;; `impl-table-known-to-not-exist?` checks for exactly that. MotherDuck's gateway forwards DuckDB's own
@@ -67,14 +72,19 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
 ;; Start conservative. Sync essentials (`:describe-fields`, `:describe-fks`, `:describe-is-nullable`,
-;; `:schemas`, `:set-timezone`, `:basic-aggregations`) are inherited `true` from Postgres. Actions,
-;; table-privileges and database-replication are already `false` for non-`:postgres` drivers (see the
-;; `(= driver :postgres)` methods in `metabase.driver.postgres`). Everything below is disabled either
-;; because it isn't implemented against the DuckDB catalog yet, or because we don't emit the
-;; corresponding metadata (see the `describe-fields` SQL below).
+;; `:describe-default-expr`, `:schemas`, `:set-timezone`, `:basic-aggregations`) are inherited `true`
+;; from Postgres. Actions, table-privileges and database-replication are already `false` for
+;; non-`:postgres` drivers (see the `(= driver :postgres)` methods in `metabase.driver.postgres`).
+;; Everything below is disabled either because it isn't implemented against the DuckDB catalog yet, or
+;; because we don't emit (or can't trust) the corresponding metadata.
 (doseq [feature [:describe-indexes            ; no index sync (we don't override describe-indexes-sql)
-                 :describe-default-expr        ; describe-fields does not emit :database-default
-                 :describe-is-generated        ; ...nor :database-is-generated
+                 ;; DuckDB DOES create the column when the test-data loader emits `GENERATED ALWAYS AS
+                 ;; (...)`, but the inherited `describe-fields-sql` (`information_schema.columns.is_generated`)
+                 ;; comes back `false`/"NEVER" for it over the MotherDuck gateway regardless -- confirmed
+                 ;; by `describe-fields-returns-is-generated-test` failing with `[false false false]`
+                 ;; instead of `[false true false]`. `:database-is-generated` is stripped in
+                 ;; `describe-fields-pre-process-xf` below so this inaccurate value never surfaces.
+                 :describe-is-generated
                  :uploads
                  :persist-models
                  :database-routing
@@ -121,46 +131,24 @@
   [_driver database]
   {:tables (into #{} (sql-jdbc.execute/reducible-query database describe-database-tables-sql))})
 
-(defmethod sql-jdbc.sync/describe-fields-sql :motherduck
-  [driver & {:keys [schema-names table-names]}]
-  ;; Column aliases are intentionally kebab-case to match the keywords `describe-fields-xf` reads
-  ;; (`reducible-query` only lower-cases labels; it does not convert `_` -> `-`), mirroring Postgres.
-  (sql/format
-   {:select    [[:col.schema_name :table-schema]
-                [:col.table_name  :table-name]
-                [:col.column_name :name]
-                [:col.data_type   :database-type]
-                [[:- :col.column_index [:inline 1]] :database-position]
-                [[:and
-                  [:not= :pk.pk_cols nil]
-                  [:list_contains :pk.pk_cols :col.column_name]]
-                 :pk?]
-                [:col.comment :field-comment]
-                [[:not :col.is_nullable] :database-required]
-                [:col.is_nullable :database-is-nullable]]
-    :from      [[[:duckdb_columns] :col]]
-    :left-join [[{:select [:schema_name :table_name [:constraint_column_names :pk_cols]]
-                  :from   [[[:duckdb_constraints] :c]]
-                  :where  [:and
-                           [:= :constraint_type [:inline "PRIMARY KEY"]]
-                           [:= :database_name [:current_database]]]}
-                 :pk]
-                [:and
-                 [:= :pk.schema_name :col.schema_name]
-                 [:= :pk.table_name :col.table_name]]]
-    :where     [:and
-                [:= :col.database_name [:current_database]]
-                [:= :col.internal false]
-                (when (seq schema-names) [:in :col.schema_name schema-names])
-                (when (seq table-names) [:in :col.table_name table-names])]
-    :order-by  [:col.schema_name :col.table_name :col.column_index]}
-   :dialect (sql.qp/quote-style driver)))
+;; No `:motherduck` override: the inherited `:postgres` `describe-fields-sql` (an
+;; `information_schema.columns` query, `udt_name` as `:database-type`) works as-is against the
+;; MotherDuck gateway and returns the same lower-case pg type names query execution does, so
+;; `database-type->base-type` can be inherited unmodified too (see below). Removed the DuckDB-native
+;; `duckdb_columns()`/`duckdb_constraints()` version and the `database-type->base-type` override that
+;; existed solely to reconcile its upper-case DuckDB type strings with Postgres's lower-case map.
+;; TODO: re-add a `:motherduck` override if tests turn up cases the inherited query gets wrong
+;; (e.g. the `pg_catalog` materialized-view branch, `col_description()`, or identity/autoincrement
+;; detection, none of which are known to work against DuckDB's pg-wire emulation).
 
 ;; Skip the Postgres implementation, which tags columns whose type is a Postgres enum; DuckDB has no
-;; such dynamic types, so delegate to the plain `:sql-jdbc` (identity) transform.
+;; such dynamic types. `:database-is-generated` is also stripped here: the inherited `describe-fields-sql`
+;; still computes it (`information_schema.columns.is_generated`), but it comes back inaccurate over the
+;; MotherDuck gateway (see the `:describe-is-generated` feature flag above), so drop it rather than
+;; surface a wrong value.
 (defmethod sql-jdbc.sync/describe-fields-pre-process-xf :motherduck
-  [driver database & args]
-  (apply (get-method sql-jdbc.sync/describe-fields-pre-process-xf :sql-jdbc) driver database args))
+  [_driver _database & _args]
+  (map #(dissoc % :database-is-generated)))
 
 ;; No Postgres enums to look up.
 (defmethod driver/dynamic-database-types-lookup :motherduck
@@ -193,87 +181,12 @@
 ;;; |                                                Type mapping                                                     |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(def ^:private duckdb-database-type->base-type
-  ;; Ported from the DuckDB community driver
-  ;; (modules/drivers/duckdb/src/metabase/driver/duckdb.clj). Pattern order matters: more specific
-  ;; patterns (e.g. `TIMESTAMP WITH TIME ZONE`) must precede their prefixes (`TIMESTAMP`). Applied to
-  ;; the *upper-cased* type string, so it also matches the lower-case type names the Postgres wire
-  ;; protocol reports for query results (e.g. `int4`, `timestamptz`).
-  (sql-jdbc.sync/pattern-based-database-type->base-type
-   [[#"BOOLEAN"                  :type/Boolean]
-    [#"BOOL"                     :type/Boolean]
-    [#"LOGICAL"                  :type/Boolean]
-    [#"HUGEINT"                  :type/BigInteger]
-    [#"UBIGINT"                  :type/BigInteger]
-    [#"BIGINT"                   :type/BigInteger]
-    [#"INT8"                     :type/BigInteger]
-    [#"LONG"                     :type/BigInteger]
-    [#"INT4"                     :type/Integer]
-    [#"SIGNED"                   :type/Integer]
-    [#"INT2"                     :type/Integer]
-    [#"SHORT"                    :type/Integer]
-    [#"INT1"                     :type/Integer]
-    [#"UINTEGER"                 :type/Integer]
-    [#"USMALLINT"                :type/Integer]
-    [#"UTINYINT"                 :type/Integer]
-    [#"INTEGER"                  :type/Integer]
-    [#"SMALLINT"                 :type/Integer]
-    [#"TINYINT"                  :type/Integer]
-    [#"INT"                      :type/Integer]
-    [#"DECIMAL"                  :type/Decimal]
-    [#"DOUBLE"                   :type/Float]
-    [#"FLOAT8"                   :type/Float]
-    [#"NUMERIC"                  :type/Float]
-    [#"REAL"                     :type/Float]
-    [#"FLOAT4"                   :type/Float]
-    [#"FLOAT"                    :type/Float]
-    [#"VARCHAR"                  :type/Text]
-    [#"BPCHAR"                   :type/Text]
-    [#"CHAR"                     :type/Text]
-    [#"TEXT"                     :type/Text]
-    [#"STRING"                   :type/Text]
-    [#"JSON"                     :type/JSON]
-    [#"BLOB"                     :type/*]
-    [#"BYTEA"                    :type/*]
-    [#"VARBINARY"                :type/*]
-    [#"BINARY"                   :type/*]
-    [#"UUID"                     :type/UUID]
-    [#"TIMESTAMPTZ"              :type/DateTimeWithTZ]
-    [#"TIMESTAMP WITH TIME ZONE" :type/DateTimeWithTZ]
-    [#"DATETIME"                 :type/DateTime]
-    [#"TIMESTAMP_S"              :type/DateTime]
-    [#"TIMESTAMP_MS"             :type/DateTime]
-    [#"TIMESTAMP_NS"             :type/DateTime]
-    [#"TIMESTAMP"                :type/DateTime]
-    [#"DATE"                     :type/Date]
-    [#"TIME"                     :type/Time]
-    [#"GEOMETRY"                 :type/*]]))
-
-(defmethod sql-jdbc.sync/database-type->base-type :motherduck
-  [driver database-type]
-  ;; Sync reads DuckDB catalog type names (`VARCHAR`, `DECIMAL(10,2)`, `INTEGER[]`, ...); query
-  ;; results come back over the Postgres wire with pg type names (`int4`, `timestamptz`, ...).
-  (let [upper (u/upper-case-en (name database-type))]
-    (cond
-      ;; Collection/nested types MUST be handled before the pattern maps below, otherwise
-      ;; `re-find` would match the *element* type inside the string (e.g. `VARCHAR[]` -> `:type/Text`)
-      ;; and downstream code (fingerprinting) would run text ops like `SUBSTRING` on an array column,
-      ;; which DuckDB rejects. `:type/Array`/`:type/Structured` are never exactly `:type/Text`.
-      (str/ends-with? upper "]")             :type/Array        ; LIST / ARRAY, incl. `T[]`, `T[N]`, `T[][]`
-      (re-find #"^(STRUCT|MAP|UNION)" upper)  :type/Structured
-      ;; Try the comprehensive Postgres map first (keyed by lower-case pg names) to preserve Postgres'
-      ;; semantics for the execute path, then fall back to the DuckDB pattern map (which handles
-      ;; precision suffixes and the `WITH TIME ZONE` spelling via regex `re-find`).
-      :else
-      (or ((get-method sql-jdbc.sync/database-type->base-type :postgres) driver database-type)
-          (duckdb-database-type->base-type upper)))))
-
-;; duckdb_columns() returns uppercase JSON as the column type, the postgres driver only matches json (lowercase), 
-;; so the override is necessary to ensure JSON columns are tagged :type/SerializedJSON.
-(defmethod sql-jdbc.sync/column->semantic-type :motherduck
-  [_driver database-type _column-name]
-  (when (and database-type (= "JSON" (u/upper-case-en database-type)))
-    :type/SerializedJSON))
+;; No `:motherduck` override: `describe-fields-sql` now feeds `database-type->base-type` the same
+;; lower-case `udt_name`/pg wire type strings (`int4`, `varchar`, `timestamptz`, ...) whether the value
+;; came from sync or from query execution, so the inherited `:postgres` map (and its `column->semantic-type`,
+;; keyed on lower-case `"json"`) applies unmodified.
+;; TODO: re-add DuckDB-only type handling (`HUGEINT`, `STRUCT`/`MAP`/`UNION`, array types, etc.) here if
+;; sync tests turn up types Postgres's map doesn't recognize.
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Query processing                                                   |
