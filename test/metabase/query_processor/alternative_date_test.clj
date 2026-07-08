@@ -445,14 +445,14 @@
   [_driver]
   :not-implemented)
 
-(doseq [driver [:h2 :postgres :databricks]]
+(doseq [driver [:h2 :postgres :databricks :motherduck]]
   (defmethod yyyymmddhhmmss-binary-dates-expected-rows driver
     [_driver]
     [[1 "foo" (OffsetDateTime/from #t "2019-04-21T16:43Z")]
      [2 "bar" (OffsetDateTime/from #t "2020-04-21T16:43Z")]
      [3 "baz" (OffsetDateTime/from #t "2021-04-21T16:43Z")]]))
 
-(doseq [driver [:mysql :sqlserver :presto-jdbc :motherduck]]
+(doseq [driver [:mysql :sqlserver :presto-jdbc]]
   (defmethod yyyymmddhhmmss-binary-dates-expected-rows driver
     [_driver]
     [[1 "foo" #t "2019-04-21T16:43"]
@@ -505,7 +505,7 @@
    [2 "bar" (.toInstant #t "2020-04-21T16:43:00Z")]
    [3 "baz" (.toInstant #t "2021-04-21T16:43:00Z")]])
 
-(doseq [driver [:mysql :sqlserver :bigquery-cloud-sdk :snowflake :vertica :presto-jdbc :starburst :athena :motherduck]]
+(doseq [driver [:mysql :sqlserver :bigquery-cloud-sdk :snowflake :vertica :presto-jdbc :starburst :athena]]
   (defmethod yyyymmddhhmmss-dates-expected-rows driver
     [_driver]
     [[1 "foo" #t "2019-04-21T16:43"]
@@ -525,7 +525,7 @@
      [2 "bar" (OffsetDateTime/from #t "2020-04-21T16:43Z[UTC]")]
      [3 "baz" (OffsetDateTime/from #t "2021-04-21T16:43Z[UTC]")]]))
 
-(doseq [driver [:h2 :postgres :clickhouse :databricks]]
+(doseq [driver [:h2 :postgres :clickhouse :databricks :motherduck]]
   (defmethod yyyymmddhhmmss-dates-expected-rows driver
     [_driver]
     [[1 "foo" (OffsetDateTime/from #t "2019-04-21T16:43Z")]

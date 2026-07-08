@@ -268,17 +268,12 @@
       (or ((get-method sql-jdbc.sync/database-type->base-type :postgres) driver database-type)
           (duckdb-database-type->base-type upper)))))
 
-;; DuckDB's `JSON` type carries JSON-encoded values.
+;; duckdb_columns() returns uppercase JSON as the column type, the postgres driver only matches json (lowercase), 
+;; so the override is necessary to ensure JSON columns are tagged :type/SerializedJSON.
 (defmethod sql-jdbc.sync/column->semantic-type :motherduck
   [_driver database-type _column-name]
   (when (and database-type (= "JSON" (u/upper-case-en database-type)))
     :type/SerializedJSON))
-
-;; Belt-and-suspenders: these schemas live in the `system` database (already excluded by the
-;; `current_database()` scoping above), but exclude them explicitly too.
-(defmethod sql-jdbc.sync/excluded-schemas :motherduck
-  [_driver]
-  #{"information_schema" "pg_catalog"})
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Query processing                                                   |
@@ -307,16 +302,21 @@
   [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
 
 ;; Postgres parses a `YYYYMMDDHH24MISS`-formatted string with the 2-arg `to_timestamp(text, text)`
-;; format-string overload; DuckDB's `to_timestamp` only has a 1-arg `(double) -> timestamptz` (Unix
-;; epoch) overload, so the inherited Postgres impl 404s ("No function matches ... to_timestamp(STRING,
-;; STRING)"). DuckDB's own string-with-format parser is `strptime`, using strftime-style `%`
-;; directives; unlike Postgres's `to_timestamp`, it returns a plain `timestamp` with no zone attached
-;; (no zone info was ever present in the source string), so this is tagged "timestamp" rather than
-;; "timestamptz" — see the matching `:motherduck` entries alongside `:mysql`/`:sqlserver`/`:presto-jdbc`
-;; (also zone-less) in the affected tests.
+;; format-string overload, which parses the fields then interprets them as local time in the session
+;; TimeZone to produce an absolute `timestamptz`; DuckDB's `to_timestamp` only has a 1-arg
+;; `(double) -> timestamptz` (Unix epoch) overload, so the inherited Postgres impl 404s ("No function
+;; matches ... to_timestamp(STRING, STRING)"). DuckDB's own string-with-format parser is `strptime`,
+;; using strftime-style `%` directives, but it only returns a zone-less `timestamp`. Casting that to
+;; `TIMESTAMPTZ` reproduces Postgres's exact semantics: DuckDB interprets the naive value as local time
+;; in the session TimeZone (confirmed live: `CAST(strptime(...) AS TIMESTAMPTZ)` under session tz
+;; America/New_York shifts the instant by the zone's offset, same as Postgres's `to_timestamp`) —
+;; `:set-timezone` is inherited unchanged from `:postgres`, so both drivers have the session TimeZone
+;; set the same way. This is why `:motherduck` sits alongside `:postgres`/`:h2`/`:databricks` (not
+;; `:mysql`/`:sqlserver`/`:presto-jdbc`, which can't produce a real `timestamptz` here) in the affected
+;; tests.
 (defmethod sql.qp/cast-temporal-string [:motherduck :Coercion/YYYYMMDDHHMMSSString->Temporal]
   [_driver _coercion-strategy expr]
-  (h2x/with-database-type-info [:strptime expr (h2x/literal "%Y%m%d%H%M%S")] "timestamp"))
+  (h2x/cast "timestamptz" [:strptime expr (h2x/literal "%Y%m%d%H%M%S")]))
 
 ;; Postgres casts a BYTEA column to text with `convert_from(expr, 'UTF8')`; DuckDB has no
 ;; `convert_from` (it errors "Scalar Function with name convert_from does not exist"). DuckDB's own
@@ -341,11 +341,19 @@
   [_driver hsql-form amount unit]
   (h2x/add-interval-honeysql-form :postgres hsql-form amount unit))
 
-;; Same as the Postgres implementation except everything that would compile to a bare `?` param is
-;; given a concrete type: `TIMEZONE(?, ?)` makes the result column type ambiguous to MotherDuck's
-;; gateway and the prepared statement is rejected. Timezone names are rendered as inline string
-;; literals (what non-parameterized drivers, e.g. Snowflake/Athena, do here anyway) and a literal
-;; datetime arg gets a TIMESTAMP cast (`->pg-timestamp` is a no-op for already-typed columns).
+;; This override compiles to:
+;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', CAST("my_field" AS timestamp)))
+;; The inherited Postgres implementation compiles to:
+;;   TIMEZONE(?, TIMEZONE(?, "my_field"))
+;; which MotherDuck's gateway rejects a bare `?` param inside a scalar function's argument list 
+;; because in these cases the bind phase is insufficient to figure out the type of these params. 
+;; Timezone names are rendered as inline string literals instead of params. The
+;; source-timezone-only branch's datetime arg gets the same treatment: converting a literal
+;; (`(convert-timezone "2024-01-01 00:00:00" "America/Los_Angeles" "UTC")`) would otherwise compile
+;; the literal to a bare `?` too --
+;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', ?))
+;; -- so it's wrapped in an explicit cast instead:
+;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', CAST(? AS timestamp)))
 (defmethod sql.qp/->honeysql [:motherduck :convert-timezone]
   [driver [_ arg target-timezone source-timezone]]
   (let [expr         (sql.qp/->honeysql driver (cond-> arg
@@ -364,6 +372,7 @@
 ;;; |                                              Result reading                                                     |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
+;; TODO: The quote issue will be fixed in motherduck Postgres Endpoint- will be able to remove this patch later. 
 (defn- parse-array-literal
   "Parse a Postgres/DuckDB array text literal (e.g. `{a,b,\"c,d\"}`, possibly nested) into a Clojure
   vector. `NULL` elements become `nil`, nested `{...}` become nested vectors.

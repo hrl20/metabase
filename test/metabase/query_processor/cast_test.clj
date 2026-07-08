@@ -898,14 +898,14 @@
   [_driver]
   [])
 
-(doseq [driver [:h2 :postgres :databricks]]
+(doseq [driver [:h2 :postgres :databricks :motherduck]]
   (defmethod binary-dates-expected-rows-simple driver
     [_driver]
     [[1 "foo" (OffsetDateTime/from #t "2019-04-21T16:43Z")]
      [2 "bar" (OffsetDateTime/from #t "2020-04-21T16:43Z")]
      [3 "baz" (OffsetDateTime/from #t "2021-04-21T16:43Z")]]))
 
-(doseq [driver [:mysql :sqlserver :presto-jdbc :motherduck]]
+(doseq [driver [:mysql :sqlserver :presto-jdbc]]
   (defmethod binary-dates-expected-rows-simple driver
     [_driver]
     [[1 "foo" #t "2019-04-21T16:43"]
