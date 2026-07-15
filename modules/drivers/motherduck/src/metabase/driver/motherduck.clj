@@ -281,59 +281,6 @@
     (h2x/with-database-type-info expr "timestamp")))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                              Result reading                                                     |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-;; ;; TODO: The quote issue will be fixed in motherduck Postgres Endpoint- will be able to remove this patch later. 
-;; (defn- parse-array-literal
-;;   "Parse a Postgres/DuckDB array text literal (e.g. `{a,b,\"c,d\"}`, possibly nested) into a Clojure
-;;   vector. `NULL` elements become `nil`, nested `{...}` become nested vectors.
-
-;;   Why we can't use the JDBC driver's own parser: MotherDuck's Postgres endpoint returns array
-;;   elements *unquoted* even when they contain spaces (e.g. `{Chez Jay,Musso & Frank}`), whereas real
-;;   Postgres quotes them (`{\"Chez Jay\",...}`). `org.postgresql`'s `PgArray.getArray()` therefore
-;;   treats the interior whitespace as insignificant and collapses it (`Chez Jay` -> `ChezJay`). The raw
-;;   string from `ResultSet.getString` is intact, so we parse that ourselves."
-;;   [^String s]
-;;   (let [n (count s)]
-;;     (letfn [(parse-elements [i]                             ; i points just past an opening '{'
-;;               (loop [i i, acc []]
-;;                 (cond
-;;                   (>= i n)                  [acc i]
-;;                   (= (.charAt s i) \})      [acc (inc i)]
-;;                   (= (.charAt s i) \,)      (recur (inc i) acc)
-;;                   (= (.charAt s i) \{)      (let [[sub j] (parse-elements (inc i))]
-;;                                               (recur j (conj acc sub)))
-;;                   (= (.charAt s i) \")      (let [[v j] (parse-quoted (inc i))]
-;;                                               (recur j (conj acc v)))
-;;                   :else                     (let [[v j] (parse-unquoted i)]
-;;                                               (recur j (conj acc v))))))
-;;             (parse-quoted [i]                               ; i points just past the opening '"'
-;;               (let [sb (StringBuilder.)]
-;;                 (loop [i i]
-;;                   (let [c (.charAt s i)]
-;;                     (cond
-;;                       (= c \\) (do (.append sb (.charAt s (inc i))) (recur (+ i 2)))
-;;                       (= c \") [(.toString sb) (inc i)]
-;;                       :else    (do (.append sb c) (recur (inc i))))))))
-;;             (parse-unquoted [i]
-;;               (loop [j i]
-;;                 (if (or (>= j n) (contains? #{\, \}} (.charAt s j)))
-;;                   (let [tok (str/trim (subs s i j))]
-;;                     [(when-not (= "NULL" (u/upper-case-en tok)) tok) j])
-;;                   (recur (inc j)))))]
-;;       (when (and (pos? n) (= \{ (.charAt s 0)))
-;;         (first (parse-elements 1))))))
-
-;; ;; Read array columns (`Types/ARRAY`, e.g. `array_agg(...)`) from the raw text literal rather than via
-;; ;; `PgArray.getArray()`, which mangles MotherDuck's unquoted whitespace-containing elements. See
-;; ;; [[parse-array-literal]].
-;; (defmethod sql-jdbc.execute/read-column-thunk [:motherduck Types/ARRAY]
-;;   [_driver ^ResultSet rs _rsmeta ^Integer i]
-;;   (fn []
-;;     (some-> (.getString rs i) parse-array-literal)))
-
-;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Driver-managed table DDL                                                |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
