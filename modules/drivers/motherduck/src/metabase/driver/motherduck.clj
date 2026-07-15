@@ -18,7 +18,6 @@
    [metabase.driver.sql-jdbc :as sql-jdbc]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
-   [metabase.driver.sql-jdbc.quoting :as sql-jdbc.quoting]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor.util :as sql.qp.u]
@@ -285,137 +284,78 @@
 ;;; |                                              Result reading                                                     |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; TODO: The quote issue will be fixed in motherduck Postgres Endpoint- will be able to remove this patch later. 
-(defn- parse-array-literal
-  "Parse a Postgres/DuckDB array text literal (e.g. `{a,b,\"c,d\"}`, possibly nested) into a Clojure
-  vector. `NULL` elements become `nil`, nested `{...}` become nested vectors.
+;; ;; TODO: The quote issue will be fixed in motherduck Postgres Endpoint- will be able to remove this patch later. 
+;; (defn- parse-array-literal
+;;   "Parse a Postgres/DuckDB array text literal (e.g. `{a,b,\"c,d\"}`, possibly nested) into a Clojure
+;;   vector. `NULL` elements become `nil`, nested `{...}` become nested vectors.
 
-  Why we can't use the JDBC driver's own parser: MotherDuck's Postgres endpoint returns array
-  elements *unquoted* even when they contain spaces (e.g. `{Chez Jay,Musso & Frank}`), whereas real
-  Postgres quotes them (`{\"Chez Jay\",...}`). `org.postgresql`'s `PgArray.getArray()` therefore
-  treats the interior whitespace as insignificant and collapses it (`Chez Jay` -> `ChezJay`). The raw
-  string from `ResultSet.getString` is intact, so we parse that ourselves."
-  [^String s]
-  (let [n (count s)]
-    (letfn [(parse-elements [i]                             ; i points just past an opening '{'
-              (loop [i i, acc []]
-                (cond
-                  (>= i n)                  [acc i]
-                  (= (.charAt s i) \})      [acc (inc i)]
-                  (= (.charAt s i) \,)      (recur (inc i) acc)
-                  (= (.charAt s i) \{)      (let [[sub j] (parse-elements (inc i))]
-                                              (recur j (conj acc sub)))
-                  (= (.charAt s i) \")      (let [[v j] (parse-quoted (inc i))]
-                                              (recur j (conj acc v)))
-                  :else                     (let [[v j] (parse-unquoted i)]
-                                              (recur j (conj acc v))))))
-            (parse-quoted [i]                               ; i points just past the opening '"'
-              (let [sb (StringBuilder.)]
-                (loop [i i]
-                  (let [c (.charAt s i)]
-                    (cond
-                      (= c \\) (do (.append sb (.charAt s (inc i))) (recur (+ i 2)))
-                      (= c \") [(.toString sb) (inc i)]
-                      :else    (do (.append sb c) (recur (inc i))))))))
-            (parse-unquoted [i]
-              (loop [j i]
-                (if (or (>= j n) (contains? #{\, \}} (.charAt s j)))
-                  (let [tok (str/trim (subs s i j))]
-                    [(when-not (= "NULL" (u/upper-case-en tok)) tok) j])
-                  (recur (inc j)))))]
-      (when (and (pos? n) (= \{ (.charAt s 0)))
-        (first (parse-elements 1))))))
+;;   Why we can't use the JDBC driver's own parser: MotherDuck's Postgres endpoint returns array
+;;   elements *unquoted* even when they contain spaces (e.g. `{Chez Jay,Musso & Frank}`), whereas real
+;;   Postgres quotes them (`{\"Chez Jay\",...}`). `org.postgresql`'s `PgArray.getArray()` therefore
+;;   treats the interior whitespace as insignificant and collapses it (`Chez Jay` -> `ChezJay`). The raw
+;;   string from `ResultSet.getString` is intact, so we parse that ourselves."
+;;   [^String s]
+;;   (let [n (count s)]
+;;     (letfn [(parse-elements [i]                             ; i points just past an opening '{'
+;;               (loop [i i, acc []]
+;;                 (cond
+;;                   (>= i n)                  [acc i]
+;;                   (= (.charAt s i) \})      [acc (inc i)]
+;;                   (= (.charAt s i) \,)      (recur (inc i) acc)
+;;                   (= (.charAt s i) \{)      (let [[sub j] (parse-elements (inc i))]
+;;                                               (recur j (conj acc sub)))
+;;                   (= (.charAt s i) \")      (let [[v j] (parse-quoted (inc i))]
+;;                                               (recur j (conj acc v)))
+;;                   :else                     (let [[v j] (parse-unquoted i)]
+;;                                               (recur j (conj acc v))))))
+;;             (parse-quoted [i]                               ; i points just past the opening '"'
+;;               (let [sb (StringBuilder.)]
+;;                 (loop [i i]
+;;                   (let [c (.charAt s i)]
+;;                     (cond
+;;                       (= c \\) (do (.append sb (.charAt s (inc i))) (recur (+ i 2)))
+;;                       (= c \") [(.toString sb) (inc i)]
+;;                       :else    (do (.append sb c) (recur (inc i))))))))
+;;             (parse-unquoted [i]
+;;               (loop [j i]
+;;                 (if (or (>= j n) (contains? #{\, \}} (.charAt s j)))
+;;                   (let [tok (str/trim (subs s i j))]
+;;                     [(when-not (= "NULL" (u/upper-case-en tok)) tok) j])
+;;                   (recur (inc j)))))]
+;;       (when (and (pos? n) (= \{ (.charAt s 0)))
+;;         (first (parse-elements 1))))))
 
-;; Read array columns (`Types/ARRAY`, e.g. `array_agg(...)`) from the raw text literal rather than via
-;; `PgArray.getArray()`, which mangles MotherDuck's unquoted whitespace-containing elements. See
-;; [[parse-array-literal]].
-(defmethod sql-jdbc.execute/read-column-thunk [:motherduck Types/ARRAY]
-  [_driver ^ResultSet rs _rsmeta ^Integer i]
-  (fn []
-    (some-> (.getString rs i) parse-array-literal)))
+;; ;; Read array columns (`Types/ARRAY`, e.g. `array_agg(...)`) from the raw text literal rather than via
+;; ;; `PgArray.getArray()`, which mangles MotherDuck's unquoted whitespace-containing elements. See
+;; ;; [[parse-array-literal]].
+;; (defmethod sql-jdbc.execute/read-column-thunk [:motherduck Types/ARRAY]
+;;   [_driver ^ResultSet rs _rsmeta ^Integer i]
+;;   (fn []
+;;     (some-> (.getString rs i) parse-array-literal)))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Driver-managed table DDL                                                |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; The `:sql-jdbc` default impls of `create-table!`/`drop-table!`/`insert-into!`/`rename-tables!*` run their SQL
-;; through `clojure.java.jdbc`, which calls pgjdbc's `executeUpdate`/`executeBatch` -- both reject the result set
-;; MotherDuck's gateway returns for *every* statement, DDL included (see AGENTS.md). Re-implemented here with a
-;; raw `Statement`/`PreparedStatement` and `.execute()`, which permits (and ignores) the returned result set --
-;; same fix already applied to the test-data loader's `execute-sql!`/`do-insert!`
-;; (`test/metabase/test/data/motherduck.clj`), needed again here because these are separate multimethods
-;; (driver-managed table actions used e.g. by `driver.sql-jdbc-test`, not test-data loading).
-(defn- raw-execute!
-  "Run `sql` (a single statement, no params) against `db-or-id` via a raw `Statement.execute`."
-  [driver db-or-id sql]
-  (sql-jdbc.execute/do-with-connection-with-options
-   driver db-or-id {:write? true}
-   (fn [^Connection conn]
-     (with-open [stmt (.createStatement conn)]
-       (.execute stmt ^String sql)))))
-
-(defmethod driver/create-table! :motherduck
-  [driver database-id table-name column-definitions & {:keys [primary-key]}]
-  (raw-execute!
-   driver database-id
-   (sql-jdbc.quoting/with-quoting driver
-     (first (sql/format {:create-table (sql-jdbc.quoting/quote-table table-name)
-                         :with-columns (cond-> (mapv (fn [[col-name type-spec]]
-                                                       (vec (cons (sql-jdbc.quoting/quote-identifier col-name)
-                                                                  (if (string? type-spec)
-                                                                    [[:raw type-spec]]
-                                                                    type-spec))))
-                                                     column-definitions)
-                                         primary-key (conj [(into [:primary-key] primary-key)]))}
-                        :quoted true
-                        :dialect (sql.qp/quote-style driver))))))
-
+;; The stock `:sql-jdbc` impl runs DROP TABLE through `jdbc/execute!` -> pgjdbc `executeUpdate`, and
+;; DROP TABLE is one of the statement classes the gateway still returns a result set for even in
+;; compatibility mode (like CREATE/DROP DATABASE and CREATE/DROP VIEW — while e.g. CREATE TABLE on the
+;; same path succeeds; confirmed by `rename-tables-test` failing only in its `drop-table!` cleanup,
+;; 2026-07-15). Raw `Statement.execute` permits (and ignores) the returned result set.
 (defmethod driver/drop-table! :motherduck
   [driver db-id table-name]
-  (raw-execute!
-   driver db-id
-   (first (sql/format {:drop-table [:if-exists (keyword table-name)]}
-                      :quoted true
-                      :dialect (sql.qp/quote-style driver)))))
-
-(defmethod driver/insert-into! :motherduck
-  [driver db-id table-name column-names values]
-  (sql-jdbc.execute/do-with-connection-with-options
-   driver db-id {:write? true}
-   (fn [^Connection conn]
-     (doseq [chunk (partition-all (or driver/*insert-chunk-rows* 100) values)
-             :let  [[sql & params] (sql/format {:insert-into (keyword table-name)
-                                                :columns     (sql-jdbc.quoting/quote-columns driver column-names)
-                                                :values      chunk}
-                                               :quoted true
-                                               :dialect (sql.qp/quote-style driver))]]
-       (with-open [stmt (.prepareStatement conn ^String sql)]
-         (when (seq params)
-           (sql-jdbc.execute/set-parameters! driver stmt params))
-         (.execute stmt))))))
-
-;; DuckDB does support multi-statement transactions, but the pg gateway always reports the connection as
-;; IDLE (see AGENTS.md), so pgjdbc's own `Connection.commit()`/`.rollback()` machinery can't be trusted to
-;; send anything. Sidestep that entirely by sending literal `BEGIN`/`COMMIT`/`ROLLBACK` SQL text over a plain
-;; autocommit connection -- the gateway/DuckDB treat those as ordinary statements, not JDBC transaction API
-;; calls, so they always go out on the wire.
-(defmethod driver/rename-tables!* :motherduck
-  [driver db-id sorted-rename-map]
-  (let [sqls (mapv (fn [[from-table to-table]]
-                     (first (sql/format {:alter-table  (keyword from-table)
-                                         :rename-table (keyword (name to-table))}
-                                        :quoted true
-                                        :dialect (sql.qp/quote-style driver))))
-                   sorted-rename-map)]
+  (let [sql (first (sql/format {:drop-table [:if-exists (keyword table-name)]}
+                               :quoted true
+                               :dialect (sql.qp/quote-style driver)))]
     (sql-jdbc.execute/do-with-connection-with-options
      driver db-id {:write? true}
      (fn [^Connection conn]
        (with-open [stmt (.createStatement conn)]
-         (.execute stmt "BEGIN;")
-         (try
-           (doseq [sql sqls]
-             (.execute stmt ^String sql))
-           (.execute stmt "COMMIT;")
-           (catch Throwable e
-             (.execute stmt "ROLLBACK;")
-             (throw e))))))))
+         (.execute stmt ^String sql))))))
+
+;; The inherited `:postgres` impl loads rows over the wire COPY protocol (`COPY ... FROM STDIN`), which
+;; MotherDuck's gateway doesn't support; use the plain chunked-INSERT `:sql-jdbc` impl instead (same
+;; opt-out as `:redshift`).
+(defmethod driver/insert-into! :motherduck
+  [driver db-id table-name column-names values]
+  ((get-method driver/insert-into! :sql-jdbc) driver db-id table-name column-names values))

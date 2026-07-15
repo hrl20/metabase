@@ -176,11 +176,14 @@
 ;;; |                                       statement execution (pg gateway)                                          |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; MotherDuck's pg gateway returns a result set for *every* statement — DDL, INSERT and SET included
-;; (e.g. a `Count` row for INSERT) — where real Postgres returns only a command tag. pgjdbc's
-;; `executeUpdate`/`executeBatch`, which the default `jdbc-execute!` ends up calling, reject that
-;; with "A result was returned when none was expected". Plain `Statement.execute` permits (and
-;; ignores) the returned result set.
+;; The gateway's `--compatibility-mode=metabase` now returns proper command tags for ordinary DML/DDL,
+;; but some statement classes are handled outside that compatibility layer and still return a result
+;; set, which pgjdbc's `executeUpdate` (what the default `jdbc-execute!` calls) rejects with "A result
+;; was returned when none was expected". Known offenders so far (confirmed by test-run failures on
+;; 2026-07-14/15): account-level statements (CREATE/DROP DATABASE), `SET` (e.g. `SET SESSION
+;; TIMEZONE`), and CREATE/DROP VIEW (`describe-view-fields` fails in `tx/drop-view!`). Raw
+;; `Statement.execute` permits (and ignores) a returned result set, so the loader paths those
+;; statements go through stay overridden below.
 (defmethod execute/execute-sql! :motherduck
   [driver ^Connection conn sql]
   (execute/default-execute-sql!
@@ -191,8 +194,10 @@
 
 (defmethod load-data/do-insert! :motherduck
   [driver ^Connection conn table-identifier rows]
-  ;; Same session-timezone pinning as the stock sql-jdbc impl, but with raw `.execute` — see
-  ;; `execute-sql!` above for why `jdbc/execute!` can't run it.
+  ;; Same session-timezone pinning as the stock sql-jdbc impl, but via raw `.execute`: `SET` still
+  ;; returns a result set (see `execute-sql!` above), and the stock impl runs it through
+  ;; `jdbc/execute!`, which rejects that. The INSERTs themselves may be fine on the stock path now,
+  ;; but the SET is inlined in the stock impl's body, so the whole method has to stay overridden.
   (with-open [stmt (.createStatement conn)]
     (.execute stmt "SET SESSION TIMEZONE TO 'UTC';"))
   ;; `set-parameter` might try to look at the DB timezone; we don't want to do that while loading
@@ -200,11 +205,6 @@
   (mt/with-database-timezone-id nil
     (doseq [[sql & params] (ddl/insert-rows-dml-statements driver table-identifier rows)]
       (try
-        ;; Raw `.execute` rather than `jdbc/execute!` for two reasons: pgjdbc's `executeUpdate` (what
-        ;; c.j.jdbc calls) rejects the result set the gateway returns for INSERT ("A result was
-        ;; returned when none was expected"), and c.j.jdbc's default wrapping transaction would never
-        ;; be COMMITted (the gateway always reports the session IDLE in ReadyForQuery, so pgjdbc
-        ;; skips sending COMMIT) — the inserted rows would be silently rolled back on close.
         (with-open [stmt (.prepareStatement conn ^String sql)]
           (when (seq params)
             (sql-jdbc.execute/set-parameters! driver stmt params))
@@ -215,8 +215,9 @@
                           e)))))))
 
 ;; The stock `:sql-jdbc/test-extensions` impls run `CREATE VIEW`/`DROP VIEW` via `jdbc/execute!`,
-;; subject to the same "result set returned for every statement" issue as `execute-sql!` above.
-;; Reuse the same SQL builders, but execute via the raw-`.execute` `execute-sql!` override.
+;; and view DDL is one of the statement classes the gateway still returns a result set for (see
+;; `execute-sql!` above). Reuse the same SQL builders, but execute via the raw-`.execute`
+;; `execute-sql!` override.
 (defmethod tx/create-view-of-table! :motherduck
   [driver database view-name table-name options]
   (sql-jdbc.execute/do-with-connection-with-options
