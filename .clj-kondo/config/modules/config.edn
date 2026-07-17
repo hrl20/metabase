@@ -2051,7 +2051,7 @@
 
   secrets
   {:team "Graphy"
-   :api  #{metabase.secrets.core}
+   :api  #{metabase.secrets.core metabase.secrets.models.secret}
    :uses #{api driver models premium-features util}
    :model-exports #{:model/Secret}}
 
