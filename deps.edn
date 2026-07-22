@@ -511,7 +511,6 @@
     "modules/drivers/starburst/test"
     "modules/drivers/vertica/test"
     "modules/drivers/motherduck/test"
-    "modules/drivers/duckdb/test"
     ]}
 
 ;;; Linters

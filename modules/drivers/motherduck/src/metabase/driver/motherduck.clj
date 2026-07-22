@@ -22,7 +22,6 @@
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor.util :as sql.qp.u]
    [metabase.driver.sql.util :as sql.u]
-   [metabase.util :as u]
    [metabase.util.date-2 :as u.date]
    [metabase.util.honey-sql-2 :as h2x])
   (:import
@@ -203,6 +202,19 @@
   [_driver s]
   (h2x/cast :text s))
 
+;; `:starts-with`/`:contains`/`:ends-with` over a literal build a `LIKE` pattern whose `\`/`_`/`%`
+;; metacharacters are backslash-escaped by the `:sql` `escape-like-pattern` default. Postgres treats
+;; `\` as the LIKE escape character *by default*, so it parents on `::like-escape-char-built-in`, whose
+;; `transform-literal-like-pattern-honeysql` is the identity (it omits the `ESCAPE '\'` clause). DuckDB
+;; has NO default LIKE escape character, so inheriting that identity behavior leaves the backslashes
+;; literal and the matches shift/drop (confirmed: `starts-with "\"` returned `[]`, `starts-with "_"`
+;; returned the `\`-prefixed rows, etc.). Restore the SQL-standard `ESCAPE '\'` clause — the same
+;; honeysql the `:sql` default emits — which DuckDB honors (verified live:
+;; `'\Backslash' LIKE '\\%' ESCAPE '\'` is true, `LIKE '\_%' ESCAPE '\'` matches only `_`-prefixed).
+(defmethod sql.qp/transform-literal-like-pattern-honeysql :motherduck
+  [_driver like-rhs-honeysql]
+  [:escape like-rhs-honeysql [:inline "\\"]])
+
 ;; Postgres compiles `:regex-match-first` to `substring(expr FROM pattern)` — a Postgres-only
 ;; two-arg POSIX-regex overload of `substring`. DuckDB's `substring` has no such overload (only
 ;; positional `substring(str, start[, len])`), so it silently tries to coerce the pattern string to
@@ -210,7 +222,7 @@
 ;; (`modules/drivers/duckdb/src/metabase/driver/duckdb.clj`): DuckDB's native `regexp_extract`
 ;; (default group 0 = whole match) is the direct equivalent.
 (defmethod sql.qp/->honeysql [:motherduck :regex-match-first]
-  [driver [_ arg pattern]]
+  [driver [_ _opts arg pattern]]
   [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
 
 ;; Postgres parses a `YYYYMMDDHH24MISS`-formatted string with the 2-arg `to_timestamp(text, text)`
@@ -267,7 +279,7 @@
 ;; -- so it's wrapped in an explicit cast instead:
 ;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', CAST(? AS timestamp)))
 (defmethod sql.qp/->honeysql [:motherduck :convert-timezone]
-  [driver [_ arg target-timezone source-timezone]]
+  [driver [_ _opts arg target-timezone source-timezone]]
   (let [expr         (sql.qp/->honeysql driver (cond-> arg
                                                  (string? arg) u.date/parse))
         timestamptz? (or (sql.qp.u/field-with-tz? arg)
