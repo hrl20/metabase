@@ -1,6 +1,5 @@
 import { useDisclosure, useElementSize } from "@mantine/hooks";
 import cx from "classnames";
-import type { Location } from "history";
 import { useCallback, useLayoutEffect, useMemo, useState } from "react";
 import { t } from "ttag";
 
@@ -14,7 +13,7 @@ import { DataStudioBreadcrumbs } from "metabase/common/data-studio/components/Da
 import { PaneHeader } from "metabase/common/data-studio/components/PaneHeader";
 import { useSetting } from "metabase/common/hooks";
 import { useDispatch } from "metabase/redux";
-import { replace } from "metabase/router";
+import { replace, useLocation } from "metabase/router";
 import { DetailedViewSwitch } from "metabase/transforms/components/DetailedViewSwitch";
 import { LockedTransformsBanner } from "metabase/transforms/components/LockedTransformsBanner/LockedTransformsBanner";
 import { POLLING_INTERVAL } from "metabase/transforms/constants";
@@ -42,11 +41,8 @@ import {
 
 const EMPTY_RUNS: TransformRun[] = [];
 
-type RunListPageProps = {
-  location: Location;
-};
-
-export function RunListPage({ location }: RunListPageProps) {
+export function RunListPage() {
+  const location = useLocation();
   const params = getParsedParams(location);
   const { page = 0 } = params;
   const { ref: containerRef, width: containerWidth } = useElementSize();
