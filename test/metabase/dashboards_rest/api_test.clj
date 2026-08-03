@@ -5678,13 +5678,14 @@
                          (t2/select-one-fn :embedding_type :model/Dashboard :id (u/the-id dashboard)))))))))))))
 
 (deftest save-dashboard-test
-  (let [response (mt/user-http-request :crowberto :post 200 "dashboard/save" {:auto_apply_filters true,
-                                                                              :name               "Test Dashboard",
-                                                                              :description        "A test dashboard to save"
-                                                                              :creator_id         399381 ;; any passed creator_id is ignored
-                                                                              })]
-    (is (partial= {:name       "Test Dashboard"
-                   :creator_id (mt/user->id :crowberto)} response))))
+  (mt/with-model-cleanup [:model/Dashboard :model/Collection]
+    (let [response (mt/user-http-request :crowberto :post 200 "dashboard/save" {:auto_apply_filters true,
+                                                                                :name               "Test Dashboard",
+                                                                                :description        "A test dashboard to save"
+                                                                                :creator_id         399381 ;; any passed creator_id is ignored
+                                                                                })]
+      (is (partial= {:name       "Test Dashboard"
+                     :creator_id (mt/user->id :crowberto)} response)))))
 
 ;;; +--------------------------------------------------------------------------------------------------+
 ;;; |       result_metadata persistence with parameters (QUE2-502)                                     |

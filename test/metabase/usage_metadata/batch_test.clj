@@ -65,6 +65,13 @@
    :native   {:query "SELECT 1"}})
 
 (defn- insert-query! [query-hash query]
+  ;; `query` is a global dedup table keyed by a content hash, not by test. Any earlier test in the same
+  ;; JVM that ran this query through the userland QP already owns the row (the QP's own writer,
+  ;; `save-queries-and-update-average-execution-times!`, tolerates the conflict; a bare insert does not).
+  ;; The `finally` blocks below delete these hashes unconditionally anyway, so clearing first changes no
+  ;; end state -- it only stops the insert from throwing. See `native-query`: a userland `SELECT 1`
+  ;; against `(mt/id)` is common enough elsewhere in the suite to hit this regularly.
+  (t2/delete! :model/Query :query_hash query-hash)
   (t2/insert! :model/Query
               {:query_hash             query-hash
                :query                  query

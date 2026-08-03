@@ -10,7 +10,6 @@
    [clojure.walk :as walk]
    [lambdaisland.deep-diff2 :as ddiff]
    [metabase.util.malli :as mu]
-   [metabase.util.malli.registry :as mr]
    [metabase.util.malli.schema :as ms]
    [rewrite-clj.node :as n]
    [rewrite-clj.parser :as r.parser]
@@ -212,50 +211,54 @@
   don't include them in our deps tree."
   '{metabase.config.core #{metabase-enterprise.core.dummy-namespace metabase.test.dummy-namespace}})
 
-(mu/defn- file-dependencies :- [:map
-                                [:namespace simple-symbol?]
-                                [:filename  string?] ; filename is relative to [[project-root]]
-                                [:module    symbol?]
-                                [:deps      [:sequential
-                                             [:map
-                                              [:namespace simple-symbol?]
-                                              [:module    symbol?]
-                                              [:dynamic {:optional true} :keyword]]]]]
+(mu/defn- file-dependencies :- [:maybe
+                                [:map
+                                 [:namespace simple-symbol?]
+                                 [:filename  string?] ; filename is relative to [[project-root]]
+                                 [:module    symbol?]
+                                 [:deps      [:sequential
+                                              [:map
+                                               [:namespace simple-symbol?]
+                                               [:module    symbol?]
+                                               [:dynamic {:optional true} :keyword]]]]]]
   [file :- [:or
             string?
             [:fn {:error/message "Instance of a java.io.File"} #(instance? java.io.File %)]]]
   (try
-    (let [decl         (ns.file/read-file-ns-decl file)
-          ns-symb      (ns.parse/name-from-ns-decl decl)
-          static-deps  (ns.parse/deps-from-ns-decl decl)
-          dynamic-deps (for [symb (find-dynamically-loaded-namespaces file)]
-                         (vary-meta symb assoc ::dynamic :require-and-friends))
-          ;;
-          ;; excluded from the diff for now, see https://metaboat.slack.com/archives/C0669P4AF9N/p1745875106092029 for
-          ;; rationale.
-          ;;
-          ;; defenterprise-deps (for [symb (find-defenterprises file)]
-          ;;                      (vary-meta symb assoc ::dynamic :defenterprise))
-          ;; defenterprise-schema-deps (for [symb (find-defenterprise-schemas file)]
-          ;;                             (vary-meta symb assoc ::dynamic :defenterprise-schema))
-          deps         (into (sorted-set) cat
-                             [static-deps
-                              dynamic-deps
-                              #_defenterprise-deps
-                              #_defenterprise-schema-deps])]
-      {:namespace ns-symb
-       :filename  (file->path-relative-to-project-root file)
-       :module    (module ns-symb)
-       :deps      (sort-by pr-str
-                           (keep (fn [required-ns]
-                                   (when-let [module (module required-ns)]
-                                     (when-not (some-> ignored-dependencies ns-symb required-ns)
-                                       (merge
-                                        {:namespace required-ns
-                                         :module    module}
-                                        (when-let [dynamic-type (::dynamic (meta required-ns))]
-                                          {:dynamic dynamic-type})))))
-                                 deps))})
+    (let [decl    (ns.file/read-file-ns-decl file)
+          ns-symb (ns.parse/name-from-ns-decl decl)]
+      ;; `file` might not actually be a namespace source file at all (e.g. a stray non-Metabase `project.clj`
+      ;; living somewhere under the scanned source roots) -- skip it rather than crashing the whole scan.
+      (when ns-symb
+        (let [static-deps  (ns.parse/deps-from-ns-decl decl)
+              dynamic-deps (for [symb (find-dynamically-loaded-namespaces file)]
+                             (vary-meta symb assoc ::dynamic :require-and-friends))
+              ;;
+              ;; excluded from the diff for now, see https://metaboat.slack.com/archives/C0669P4AF9N/p1745875106092029 for
+              ;; rationale.
+              ;;
+              ;; defenterprise-deps (for [symb (find-defenterprises file)]
+              ;;                      (vary-meta symb assoc ::dynamic :defenterprise))
+              ;; defenterprise-schema-deps (for [symb (find-defenterprise-schemas file)]
+              ;;                             (vary-meta symb assoc ::dynamic :defenterprise-schema))
+              deps         (into (sorted-set) cat
+                                 [static-deps
+                                  dynamic-deps
+                                  #_defenterprise-deps
+                                  #_defenterprise-schema-deps])]
+          {:namespace ns-symb
+           :filename  (file->path-relative-to-project-root file)
+           :module    (module ns-symb)
+           :deps      (sort-by pr-str
+                               (keep (fn [required-ns]
+                                       (when-let [module (module required-ns)]
+                                         (when-not (some-> ignored-dependencies ns-symb required-ns)
+                                           (merge
+                                            {:namespace required-ns
+                                             :module    module}
+                                            (when-let [dynamic-type (::dynamic (meta required-ns))]
+                                              {:dynamic dynamic-type})))))
+                                     deps))})))
     (catch Throwable e
       (throw (ex-info (format "Error calculating dependencies for %s" file)
                       {:file file}

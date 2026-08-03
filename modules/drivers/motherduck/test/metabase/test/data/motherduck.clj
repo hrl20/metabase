@@ -1,0 +1,293 @@
+(ns metabase.test.data.motherduck
+  "Test-data extensions for the `:motherduck` driver.
+
+  Everything goes through MotherDuck's Postgres wire-protocol endpoint — sync/queries by the
+  driver-under-test AND test-data loading (CREATE DATABASE / CREATE TABLE / INSERT) alike, using
+  the same connection details / `connection-details->spec :motherduck` as the driver itself.
+  `:motherduck` derives from `:postgres`, so the stock Postgres/SQL-JDBC test extensions do nearly
+  all of the work; the overrides below cover only the places where the backend (DuckDB) differs
+  from real Postgres."
+  (:require
+   [metabase.config.core :as config]
+   [metabase.driver :as driver]
+   [metabase.driver.motherduck-test.util :as motherduck-test.util]
+   [metabase.driver.sql-jdbc.connection-test :as connection-test]
+   [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
+   [metabase.driver.sql-jdbc.sync.describe-table-test :as describe-table-test]
+   [metabase.test :as mt]
+   [metabase.test.data.interface :as tx]
+   [metabase.test.data.sql :as sql.tx :refer [qualify-and-quote]]
+   [metabase.test.data.sql-jdbc.execute :as execute]
+   [metabase.test.data.sql-jdbc.load-data :as load-data]
+   [metabase.test.data.sql-jdbc.spec :as spec]
+   [metabase.test.data.sql.ddl :as ddl]
+   [metabase.util.random :as u.random])
+  (:import
+   (java.sql Connection)))
+
+(set! *warn-on-reflection* true)
+
+;; We don't call `(sql-jdbc.tx/add-test-extensions! :motherduck)` here: `:motherduck` derives from
+;; `:postgres` (see `metabase.driver.motherduck`), and Postgres's test extensions already derive
+;; `:postgres` -> `:sql-jdbc/test-extensions`. So `:motherduck` inherits the SQL-JDBC test extensions
+;; transitively, and re-deriving them would trip `clojure.core/derive`'s "already has ... as ancestor"
+;; assertion. (Same reasoning as the Redshift test extensions.)
+
+(doseq [[feature supported?] {:upload-with-auto-pk (not config/is-test?)
+                              :test/time-type false
+                              ::describe-table-test/describe-materialized-view-fields false ; motherduck has no materialized views
+                              ;; `describe-fields-sql` reads PRIMARY KEY columns from `duckdb_constraints`
+                              ;; and emits `pk?`, even though `:metadata/key-constraints` is false (the
+                              ;; loader can't create FKs). Same situation as `:mongo`/`:sqlite`; the
+                              ;; `::describe-pks` proxy otherwise infers false from key-constraints.
+                              ::describe-table-test/describe-pks true
+                              :test/cannot-destroy-db true
+                              ;; The gateway authenticates with the token as the password; `:user` is
+                              ;; cosmetic (see `dbdef->connection-details` above) and isn't checked, so
+                              ;; corrupting only `:user` (as `test-bad-connection-detail-acquisition`
+                              ;; does) can't break the connection. Same situation as `:hive-like`.
+                              ::connection-test/regular-connection-pooling false}]
+  (defmethod driver/database-supports? [:motherduck feature] [_driver _feature _db] supported?))
+
+;; The gateway ignores unknown detail keys (`{:unknown_config "single"}`, the stock stub other test
+;; extensions use, doesn't break anything here), but it always requires `:dbname` to name a database
+;; that exists (see `dbdef->connection-details` above) — so pointing it at one that doesn't reliably
+;; fails the connection.
+(defmethod tx/bad-connection-details :motherduck
+  [_driver]
+  {:dbname (u.random/random-name)})
+
+;; Inherited from `:postgres`, but that impl hardcodes the `public` schema; DuckDB/MotherDuck puts
+;; user tables in `main`.
+(defmethod tx/agg-venues-by-category-id :motherduck
+  [_driver]
+  "select category_id, array_agg(name)
+   from main.venues
+   group by category_id
+   order by 1 asc
+   limit 2;")
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                              Connection details                                                 |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; Postgres-wire connection details to MotherDuck, used both by the driver-under-test and by the
+;; test-data loader (`spec/dbdef->spec` builds JDBC specs from these via `connection-details->spec
+;; :motherduck`). Host/port/user default to the us-east-1 endpoint and a (cosmetic) `metabase` user,
+;; overridable via MB_MOTHERDUCK_TEST_{HOST,PORT,USER}; the password is the MotherDuck token,
+;; overridable via MB_MOTHERDUCK_TEST_PASSWORD.
+;;
+;; The pg gateway always needs a `dbname` that exists: unlike Postgres — which falls back to a
+;; default database when `dbname` is absent — it defaults `dbname` to the *username* and refuses the
+;; connection with "failed to attach '<user>'" if no such database exists. So the `:server` context
+;; (used to run CREATE/DROP DATABASE, possibly before/after the test database exists) connects to a
+;; database assumed to always exist: `my_db` unless MB_MOTHERDUCK_TEST_SERVER_DBNAME says otherwise.
+;; MotherDuck DDL is account-scoped, so CREATE/DROP DATABASE for *other* databases works fine from
+;; that session. Some callers pass a `nil` context with a real `database-name` (e.g. the snowplow
+;; create-db API test), so gate on `:server` rather than only matching `:db`.
+(defmethod tx/dbdef->connection-details :motherduck
+  [_driver context {:keys [database-name]}]
+  {:host     (tx/db-test-env-var :motherduck :host "pg.us-east-1-aws.motherduck.com")
+   :port     (tx/db-test-env-var :motherduck :port 5432)
+   :user     (tx/db-test-env-var :motherduck :user "metabase")
+   :password (or (tx/db-test-env-var :motherduck :password) (motherduck-test.util/motherduck-token))
+   :ssl      true
+   :dbname   (if (and database-name (not= context :server))
+               database-name
+               (tx/db-test-env-var :motherduck :server-dbname "my_db"))})
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                              DDL / type dialect                                                 |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(doseq [[base-type db-type] {:type/BigInteger     "BIGINT"
+                             :type/Boolean        "BOOL"
+                             :type/Date           "DATE"
+                             :type/DateTime       "TIMESTAMP"
+                             :type/DateTimeWithTZ "TIMESTAMPTZ"
+                             :type/Decimal        "DECIMAL"
+                             :type/Float          "DOUBLE"
+                             :type/Integer        "INTEGER"
+                             :type/Text           "STRING"
+                             :type/Time           "TIME"
+                             ;; `:motherduck` derives from `:postgres` in `driver/hierarchy`, and
+                             ;; Postgres explicitly maps `:type/TimeWithTZ` -> "TIME WITH TIME ZONE"
+                             ;; (a real DuckDB type, TIMETZ). Without an override here, dispatch for
+                             ;; these types falls through to that inherited Postgres mapping, so
+                             ;; `attempted-murders`' `time_ltz`/`time_tz` columns get created as
+                             ;; DuckDB TIMETZ. But the pg-gateway's JDBC ResultSetMetaData reports
+                             ;; those columns back as plain `Types.TIME` (not
+                             ;; `TIME_WITH_TIMEZONE`), so `read-column-thunk` uses the zone-less
+                             ;; reader and returns a bare `LocalTime`, silently dropping the offset —
+                             ;; a gateway type-fidelity gap, not something fixable on the read side.
+                             ;; Map these to plain "TIME" (same as `:type/Time`) so the test
+                             ;; framework's `driver-distinguishes-between-base-types?` correctly
+                             ;; reports no TZ-aware TIME support here, matching actual behavior (and
+                             ;; matching the sibling community `:duckdb` driver, which never claims
+                             ;; this support either).
+                             :type/TimeWithTZ          "TIME"
+                             :type/TimeWithLocalTZ     "TIME"
+                             :type/TimeWithZoneOffset  "TIME"
+                             :type/UUID           "UUID"}]
+  (defmethod sql.tx/field-base-type->sql-type [:motherduck base-type] [_ _] db-type))
+
+;; DuckDB has no SERIAL (the Postgres pk type); PK ids are plain INTEGERs generated by the loader
+;; (see `row-xform` below).
+(defmethod sql.tx/pk-sql-type :motherduck [_] "INTEGER")
+
+;; Inherited from `:postgres` as "public", but DuckDB/MotherDuck put user tables in `main`. Tests that
+;; qualify table names with `(sql.tx/session-schema driver)` (renames, view creation, ...) otherwise
+;; target a nonexistent `public` schema.
+(defmethod sql.tx/session-schema :motherduck [_driver] "main")
+
+(defmethod sql.tx/create-db-sql :motherduck
+  [driver {:keys [database-name]}]
+  (format "CREATE DATABASE IF NOT EXISTS %s;" (qualify-and-quote driver database-name)))
+
+;; Skip the Postgres impl, which prepends a `pg_stat_activity` connection-killing DO block that
+;; DuckDB can't run. These statements execute over a `:server`-context connection — attached to a
+;; *different* database (see `dbdef->connection-details`) — so a plain DROP works.
+(defmethod ddl/drop-db-ddl-statements :motherduck
+  [driver {:keys [database-name]} & _]
+  [(format "DROP DATABASE IF EXISTS %s CASCADE;" (qualify-and-quote driver database-name))])
+
+;; DuckDB has no `ALTER TABLE ... ADD FOREIGN KEY`, so test datasets are created without FK
+;; constraints (matches `:metadata/key-constraints false` in the driver).
+(defmethod sql.tx/add-fk-sql :motherduck [& _] nil)
+
+;; Inherited from `:postgres` as "GENERATED ALWAYS AS (%s) STORED", but DuckDB only supports VIRTUAL
+;; generated columns (the default when `STORED`/`VIRTUAL` is omitted) — `STORED` errors with "Can not
+;; create a STORED generated column!". Same expression `sql.tx/generated-column-sql :default` uses.
+(defmethod sql.tx/generated-column-sql :motherduck [_ expr]
+  (format "GENERATED ALWAYS AS (%s)" expr))
+
+(defmethod load-data/row-xform :motherduck
+  [_driver _dbdef tabledef]
+  (load-data/maybe-add-ids-xform tabledef))
+
+;; The Postgres impl loads each table in a single INSERT, but the Postgres JDBC driver caps a
+;; prepared statement at 65,535 parameters, which bigger tables (e.g. sample-dataset `orders`)
+;; exceed. Restore the stock chunked loading.
+(defmethod load-data/chunk-size :motherduck
+  [_driver _dbdef _tabledef]
+  200)
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                       statement execution (pg gateway)                                          |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; The gateway's `--compatibility-mode=metabase` now returns proper command tags for ordinary DML/DDL,
+;; but some statement classes are handled outside that compatibility layer and still return a result
+;; set, which pgjdbc's `executeUpdate` (what the default `jdbc-execute!` calls) rejects with "A result
+;; was returned when none was expected". Known offenders so far (confirmed by test-run failures on
+;; 2026-07-14/15): account-level statements (CREATE/DROP DATABASE), `SET` (e.g. `SET SESSION
+;; TIMEZONE`), and CREATE/DROP VIEW (`describe-view-fields` fails in `tx/drop-view!`). Raw
+;; `Statement.execute` permits (and ignores) a returned result set, so the loader paths those
+;; statements go through stay overridden below.
+(defmethod execute/execute-sql! :motherduck
+  [driver ^Connection conn sql]
+  (execute/default-execute-sql!
+   driver conn sql
+   :execute! (fn [^Connection conn ^String sql]
+               (with-open [stmt (.createStatement conn)]
+                 (.execute stmt sql)))))
+
+(defmethod load-data/do-insert! :motherduck
+  [driver ^Connection conn table-identifier rows]
+  ;; Same session-timezone pinning as the stock sql-jdbc impl, but via raw `.execute`: `SET` still
+  ;; returns a result set (see `execute-sql!` above), and the stock impl runs it through
+  ;; `jdbc/execute!`, which rejects that. The INSERTs themselves may be fine on the stock path now,
+  ;; but the SET is inlined in the stock impl's body, so the whole method has to stay overridden.
+  (with-open [stmt (.createStatement conn)]
+    (.execute stmt "SET SESSION TIMEZONE TO 'UTC';"))
+  ;; `set-parameter` might try to look at the DB timezone; we don't want to do that while loading
+  ;; the data because the DB hasn't been synced yet.
+  (mt/with-database-timezone-id nil
+    (doseq [[sql & params] (ddl/insert-rows-dml-statements driver table-identifier rows)]
+      (try
+        (with-open [stmt (.prepareStatement conn ^String sql)]
+          (when (seq params)
+            (sql-jdbc.execute/set-parameters! driver stmt params))
+          (.execute stmt))
+        (catch Throwable e
+          (throw (ex-info (format "INSERT FAILED: %s" (ex-message e))
+                          {:driver driver, :sql sql}
+                          e)))))))
+
+;; The stock `:sql-jdbc/test-extensions` impls run `CREATE VIEW`/`DROP VIEW` via `jdbc/execute!`,
+;; and view DDL is one of the statement classes the gateway still returns a result set for (see
+;; `execute-sql!` above). Reuse the same SQL builders, but execute via the raw-`.execute`
+;; `execute-sql!` override.
+(defmethod tx/create-view-of-table! :motherduck
+  [driver database view-name table-name options]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver database {:write? true}
+   (fn [conn]
+     (execute/execute-sql! driver conn (first (sql.tx/create-view-of-table-sql driver database view-name table-name options))))))
+
+(defmethod tx/drop-view! :motherduck
+  [driver database view-name options]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver database {:write? true}
+   (fn [conn]
+     (execute/execute-sql! driver conn (first (sql.tx/drop-view-sql driver database view-name options))))))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                      create / load / cleanup lifecycle                                          |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defonce ^:private ^{:doc "Names of every MotherDuck database this test run has created (or ensured
+  exists). Cleanup only ever drops databases in this set, so a shared MotherDuck account's real
+  databases are never touched."}
+  created-databases
+  (atom #{}))
+
+(defmethod tx/create-db! :motherduck
+  [driver dbdef & options]
+  (swap! created-databases conj (:database-name dbdef))
+  (apply load-data/create-db! driver dbdef options))
+
+(defmethod tx/dataset-already-loaded? :motherduck
+  [driver dbdef]
+  ;; Track the name so `after-run` cleanup drops the database even if `create-db!` never runs for
+  ;; it (e.g. it was left behind by a previous run that crashed before its own cleanup).
+  (swap! created-databases conj (:database-name dbdef))
+  (try
+    (sql-jdbc.execute/do-with-connection-with-options
+     driver
+     (spec/dbdef->spec driver :db dbdef)
+     {:write? false}
+     (fn [^java.sql.Connection conn]
+       ;; Check the dataset's first table rather than mere connectability (the stock sql-jdbc
+       ;; impl), so a database that a crashed run created but never finished loading gets reloaded
+       ;; instead of trusted.
+       (with-open [stmt (.prepareStatement conn (str "SELECT 1 FROM duckdb_tables() "
+                                                     "WHERE database_name = current_database() AND table_name = ? "
+                                                     "LIMIT 1"))]
+         (.setString stmt 1 (:table-name (first (:table-definitions dbdef))))
+         (with-open [rset (.executeQuery stmt)]
+           (.next rset)))))
+    (catch Throwable _
+      ;; the pg gateway refuses the connection outright when the database doesn't exist
+      false)))
+
+(defmethod tx/before-run :motherduck
+  [_driver]
+  ;; Nothing has been created yet, so there's nothing to drop; just make sure tracking starts from a
+  ;; clean slate (e.g. after a previous run in the same REPL that didn't reach `after-run`).
+  (reset! created-databases #{}))
+
+(defmethod tx/after-run :motherduck
+  [driver]
+  ;; Drop only the databases this test run created (tracked in [[created-databases]]), leaving any
+  ;; other databases in the account — e.g. the built-in `sample_data` or a developer's own —
+  ;; untouched.
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver
+   (spec/dbdef->spec driver :server nil)
+   {:write? true}
+   (fn [^java.sql.Connection conn]
+     (doseq [db-name @created-databases]
+       (with-open [stmt (.createStatement conn)]
+         (.execute stmt (format "DROP DATABASE IF EXISTS \"%s\" CASCADE;" db-name))))
+     (reset! created-databases #{}))))

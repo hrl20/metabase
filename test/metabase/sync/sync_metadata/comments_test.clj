@@ -1,15 +1,15 @@
 (ns ^:mb/driver-tests metabase.sync.sync-metadata.comments-test
   "Test for the logic that syncs Table column descriptions with the comments fetched from a DB."
   (:require
-   [clojure.java.jdbc :as jdbc]
    [clojure.test :refer :all]
    [metabase.driver :as driver]
-   [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+   [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.sync.core :as sync]
    [metabase.sync.sync-metadata.tables :as sync-tables]
    [metabase.test :as mt]
    [metabase.test.data.interface :as tx]
    [metabase.test.data.sql :as sql.tx]
+   [metabase.test.data.sql-jdbc.execute :as sql-jdbc.tx.execute]
    [metabase.util :as u]
    [toucan2.core :as t2]))
 
@@ -142,13 +142,21 @@
             added-comment (mt/random-name)
             dbdef (basic-table table-name nil)]
         (mt/dataset dbdef
-          ;; create the comment
-          (jdbc/execute! (sql-jdbc.conn/db->pooled-connection-spec (mt/db))
-                         [(sql.tx/standalone-table-comment-sql
-                           driver/*driver*
-                           dbdef
-                           (tx/map->TableDefinition {:table-name table-name
-                                                     :table-comment added-comment}))]
-                         {:transaction? false}) ;; trino needs transactions off
+          ;; Create the comment. Run it through the driver's `execute-sql!` test extension rather than
+          ;; `jdbc/execute!` directly -- the default impl is that same `jdbc/execute!` with transactions
+          ;; off (trino needs them off), but drivers whose DDL needs a different JDBC execute method can
+          ;; override it. This is the same seam the test-data loader uses for every other DDL statement,
+          ;; including this exact `standalone-table-comment-sql` at table-creation time.
+          (sql-jdbc.execute/do-with-connection-with-options
+           driver/*driver* (mt/db) {:write? true}
+           (fn [conn]
+             (sql-jdbc.tx.execute/execute-sql!
+              driver/*driver*
+              conn
+              (sql.tx/standalone-table-comment-sql
+               driver/*driver*
+               dbdef
+               (tx/map->TableDefinition {:table-name table-name
+                                         :table-comment added-comment})))))
           (sync-tables/sync-tables-and-database! (mt/db))
           (is (true? (t2/exists? :model/Table :db_id (mt/id) :description added-comment))))))))
