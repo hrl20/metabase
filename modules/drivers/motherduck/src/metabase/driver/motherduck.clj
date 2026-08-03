@@ -19,6 +19,8 @@
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
+   [metabase.driver.sql-jdbc.sync.common :as sql-jdbc.sync.common]
+   [metabase.driver.sql-jdbc.sync.describe-table :as sql-jdbc.describe-table]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor.util :as sql.qp.u]
    [metabase.driver.sql.util :as sql.u]
@@ -152,6 +154,32 @@
 (defmethod driver/dynamic-database-types-lookup :motherduck
   [_driver _database _database-types]
   nil)
+
+;; The inherited `:sql-jdbc` `get-table-pks` calls pgjdbc's `DatabaseMetaData.getPrimaryKeys`, whose SQL
+;; self-joins `pg_class` and projects `information_schema._pg_expandarray(indkey)` through a subquery.
+;; DuckDB plans that shape pathologically: over the gateway it dies with "Out of Memory Error: failed to
+;; pin block of size 256.0 KiB (47.4 MiB/47.6 MiB used)". Verified 2026-07-29 to be the query shape and
+;; not data volume or connection reuse: it reproduces on the first statement of a brand-new connection
+;; against a catalog with 56 `pg_class` rows and an empty `pg_index`, and disappears as soon as the
+;; second `pg_class` alias (`ci.relname`, the PK_NAME column) is dropped from the select list. Reading
+;; the same information from `duckdb_constraints()` costs one cheap query. Overriding this method is the
+;; established escape hatch for backends whose JDBC `getPrimaryKeys` misbehaves (`:oracle`, `:snowflake`,
+;; `:clickhouse` all do it). Only `driver/table-exists?`'s default impl (via `describe-table`) reaches
+;; this on `:motherduck` -- sync itself uses the inherited `describe-fields`, which already derives `pk?`
+;; from `information_schema.table_constraints` and is unaffected.
+(def ^:private table-pks-sql
+  (str "SELECT unnest(constraint_column_names) FROM duckdb_constraints()"
+       " WHERE database_name = current_database() AND constraint_type = 'PRIMARY KEY'"
+       " AND schema_name = ? AND table_name = ?"))
+
+(defmethod sql-jdbc.describe-table/get-table-pks :motherduck
+  [driver ^Connection conn _db-name-or-nil table]
+  (with-open [stmt (sql-jdbc.sync.common/prepare-statement driver conn table-pks-sql [(:schema table) (:name table)])
+              rs   (.executeQuery stmt)]
+    (loop [pks []]
+      (if (.next rs)
+        (recur (conj pks (.getString rs 1)))
+        pks))))
 
 (defmethod sql-jdbc.sync/describe-fks-sql :motherduck
   [driver & {:keys [schema-names table-names]}]

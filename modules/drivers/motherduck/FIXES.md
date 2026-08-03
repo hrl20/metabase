@@ -29,6 +29,8 @@ Format: one section per namespace; each fixed test listed with brief notes on th
 | metabase.query-processor.coercion-test | 0/1 | ✅ all pass |
 | metabase.query-processor.cumulative-aggregation-test | 0/1 | ✅ all pass |
 | metabase.query-processor.string-extracts-test | 0/2 | ✅ all pass (feature-flag fix — see notes) |
+| metabase.warehouse-schema-rest.api.table-test | 3/0 | ✅ all pass, 2/2 standalone runs (no driver fix possible — namespace runs entirely against H2; see 2026-07-29 notes) |
+| metabase.usage-metadata.batch-test | 0/1 | ✅ all pass (upstream test-isolation fix, no driver code — namespace runs entirely against H2; see 2026-08-02 notes) |
 
 ## Fixes
 
@@ -365,3 +367,346 @@ Assigned the same 16-failing-assertion baseline documented twice already (lines 
 **Attempted reproduction:** ran `metabase.collections-rest.api-test` (179 combined tests; by far the heaviest user of `(perms/grant-collection-read-permissions! (perms/all-users-group) ...)` / `readwrite-permissions!` in the test tree — dozens of call sites) immediately before `metabase.permissions.models.collection.graph-test` in the same JVM/process (`DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only '[metabase.collections-rest.api-test metabase.permissions.models.collection.graph-test]'`). Result: **742 assertions, 0 failures, 0 errors** — did not reproduce. This is a negative result, not a refutation: every grant in that namespace's happy-path tests is paired with a `with-temp`-scoped Collection (so `before-delete` cleans up the permission too) or an explicit revoke, so this namespace alone isn't the leak source under normal (non-erroring) conditions. The actual leaked grant in a from-broken-state full-suite run most likely originates from some other namespace's test that partially fails/throws before its own cleanup runs, or from a Collection that outlives a single test (fixture-scoped) — finding the exact culprit would require bisecting dozens of namespaces across a multi-hour full-suite run, which is out of proportion for a namespace that (a) has zero `driver/*` dependency, (b) has now been independently confirmed clean three times, and (c) whose failure mode is now mechanistically understood (sequential state leak on a shared global magic-group row, not a driver defect, not JVM classloading corruption, and not live parallelism).
 
 **No code changes made.** No `.clj` files touched; only this FIXES.md entry. Recommend any future re-assignment of this namespace skip straight to closing it out unless a concrete culprit test is identified by other means (e.g. a full-suite run's per-namespace ordering/timing correlated with which namespace ran immediately before this one).
+
+### 2026-07-29 — metabase.warehouse-schema-rest.api.table-test — ✅ 58 tests, 252 assertions, 0 fail/err (no driver fix needed; namespace exercises zero MotherDuck code)
+
+**Assigned baseline (3 failures):** one "missing `:event/table-read` publication", two `users`-table metadata/`database_type` mismatches. Assigned under the namespace name `metabase.warehouse-schema.api.table-test`, which **does not exist** — the real namespace is `metabase.warehouse-schema-rest.api.table-test` (`test/metabase/warehouse_schema_rest/api/table_test.clj`); running the assigned name dies with `FileNotFoundException` before any test executes. Mapping the three descriptions onto real tests: `api-database-table-endpoint-test` (asserts exactly one `:event/table-read` for `["public" "orders"]`), `sensitive-fields-included-test` and `sensitive-fields-not-included-test` (the only two tests in the file that assert a full `query_metadata` payload for the `users` table, including `:database_type "BIGINT"` / `"CHARACTER VARYING"` / `"TIMESTAMP"`).
+
+**Result: not reproducible. 2/2 independent standalone runs clean** (`DRIVERS=motherduck clojure -X:dev:drivers:drivers-dev:test :only metabase.warehouse-schema-rest.api.table-test` → 58 tests, 252 assertions, 0 failures, 0 errors both times). All three named tests are present and green in the JUnit XML of both runs (`api-database-table-endpoint-test` 9/9 assertions, `sensitive-fields-included-test` 2/2, `sensitive-fields-not-included-test` 2/2). This repeats the earlier entry for this same namespace (line 229, 2026-07-05), which reached the same verdict for the same two `sensitive-fields-*` tests; only the `:event/table-read` test is new (it was added to the file since).
+
+**Structural argument that no failure here can be a MotherDuck defect** — this is the part worth keeping, because it means the namespace should be closed out permanently rather than re-triaged a third time:
+
+1. The only driver scoping anywhere in the file is `(mt/test-driver :h2 ...)` (4 CSV-upload tests, lines 1140/1152/1171/1183). There is no `mt/test-drivers` block, so **every other test in the namespace runs with `driver/*driver*` unbound**, and `tx/driver` (`test/metabase/test/data/interface.clj:234`) resolves `(or driver/*driver* :h2)` → **H2**. `DRIVERS=motherduck` only changes `tx.env/test-drivers`, which is consulted by `mt/test-driver(s)` and nothing else (`metabase.test-runner` binds no driver; `^:mb/driver-tests` on the ns form is a clj-kondo lint marker with no runtime effect). So `(mt/id :users)` / `(mt/id :orders)` / `(mt/db)` in all three assigned tests point at the **H2** `test-data` database, and the expected `"BIGINT"` / `"CHARACTER VARYING"` / `"TIMESTAMP"` strings are H2 type names, not MotherDuck ones. `describe-fields`/`database-type->base-type` for `:motherduck` are never invoked by this namespace.
+2. Under `DRIVERS=motherduck` the 4 `mt/test-driver :h2` tests are the only ones that get *skipped*; nothing gets *added*.
+3. The expected-value scaffolding already anticipates a non-H2 `driver/*driver*` (`table-defaults`'s `:is_writable (or (= driver :h2) nil)`, and the explicit `(table-defaults :h2)` call sites), so even the parts of the file that are driver-aware are written to stay correct — nothing there needs a `:motherduck` expected-value override.
+
+**Most likely mechanism for the full-suite failures (driver-agnostic, sequential state leak — same shape as the `collection.graph-test` entry above):** hawk never runs two namespaces concurrently (`:multithread? :vars` parallelizes only `^:parallel` vars *within* a namespace; namespaces are iterated with a plain `map` and each one's futures are awaited before the next starts — verified in the 2026-07-07 entry above), so these cannot be live cross-namespace races. They have to be leftover app-DB state from an earlier namespace in the same JVM:
+- `sensitive-fields-*-test` diff the *entire* `GET /api/table/:id/query_metadata` payload for the shared, mutable H2 `test-data` `users` Table and its 4 Fields. Some values are re-read live from the app DB when building the expected map (`:view_count`, `:fingerprint`, `:last_analyzed`, `:updated_at` via `field-details`), but others are **hardcoded literals** — `:has_field_values "list"`/`"none"`, `:semantic_type`, `:visibility_type`, `:database_position`. Any earlier namespace that mutates those columns (or deletes/recreates `FieldValues`) for H2 `test-data` `users` without restoring them makes these two tests fail with a `users`-table metadata diff, exactly as reported.
+- `api-database-table-endpoint-test` captures events with `mt/with-dynamic-fn-redefs [events/publish-event! ...]`, which works by **globally `bindRoot`-ing a proxy onto the var once and never restoring it**, then dispatching through a thread-local `*local-redefs*` map (`test/metabase/test/util/dynamic_redefs.clj:65-76`). It passes standalone because `mt/user-http-request` is an in-process mock request on the calling thread (`test/metabase/test/data/users.clj:231`), so the endpoint's synchronous `publish-event!` at `src/metabase/warehouse_schema_rest/api/table.clj:175` sees the binding. The one thing that defeats it is the var's root not being the proxy at that moment — and several other namespaces redefine `events/publish-event!` with plain **`with-redefs`** (`test/metabase/transforms/canceling_test.clj:138`, `test/metabase/transforms/models/transform_test.clj:172`, `test/metabase/documents/models/document_test.clj:797`, plus 3 sites in `enterprise/backend/test/metabase_enterprise/security_center/notification_test.clj`), i.e. an unsynchronized root swap on the same var. Any interleaving or non-restoring path there leaves a mock (or a stale root) installed, and this test's thread-local replacement is then bypassed → `@published-events` is empty → "missing `:event/table-read`". None of those `with-redefs` sites are `^:parallel`, so this is a plausible mechanism rather than a proven one; pinning it down would need a full-suite run with per-namespace ordering, which is out of proportion here.
+
+**No code changes made.** No `.clj` files touched; only this FIXES.md entry. `simplification.md` deliberately left alone — it is an override-by-override vetting document for `motherduck.clj`, and there is no override to vet here.
+
+**Operational note for other agents:** `target/junit/` is a *single shared directory* wiped at the start of every run. During this session it was clobbered mid-investigation by another concurrently running test process, so `bin/junit-report.py` reported "0 failures across 0 namespaces" for results that had existed minutes earlier. If agents are being run in parallel, treat the run's own stdout tail (`Ran N tests ... M assertions, X failures, Y errors`) as authoritative and copy any JUnit XML you care about out of `target/junit/` immediately after the run. A stale/clobbered `junit-failures.jsonl` is also the most likely explanation for how this namespace got assigned under a name that does not exist, with failure descriptions that match the tests' *expected* (H2) values rather than any observed actual.
+
+### 2026-08-01 — metabase.collections-rest.api-test/fetch-root-items-fully-parameterized-field-filter-test — ✅ fixed, but NOT a driver bug (one-line upstream test fix; no `motherduck.clj` change)
+
+**Assigned as** a "cross-database-id validation issue, Database 1 (motherduck) vs Database 2 (h2)". That framing is accurate about the symptom and wrong about the cause: nothing in the failure path executes a single line of MotherDuck code.
+
+**Root cause.** The test hardcoded `:dimension [:field 1 nil]` in a native template tag while pointing `:database (mt/id)` at the **H2** `test-data` db (this namespace has no `mt/test-driver(s)` wrapper, so `tx/driver` → `(or driver/*driver* :h2)` → H2; see the 2026-07-29 entry above). It therefore silently assumes *field id 1 belongs to whatever database `(mt/id)` returns* — an invariant that only holds when H2 `test-data` is the first warehouse DB created in the JVM. Under `DRIVERS=motherduck` an earlier namespace loads the motherduck `test-data` dataset first, so it takes `Database` id 1 and `metabase_field` ids 1..N; H2 `test-data` becomes id 2. On `:model/Card` insert, `check-field-filter-fields-are-from-correct-database` (`src/metabase/queries/models/card.clj:410-440`) rejects it with HTTP 400:
+
+```
+Invalid Field Filter: Field 1 "categories"."id" belongs to Database 1 "test-data (motherduck)",
+but the query is against Database 2 "test-data (h2)"
+```
+
+**Fix** (`test/metabase/collections_rest/api_test.clj:2368`, 1 line): `[:field 1 nil]` → `[:field (mt/id :venues :id) nil]`. This is not a new pattern — the sibling test in the same file (`fetch-root-items-fully-parameterized-all-defaults-test`, line 2431) already writes `[:field (mt/id :venues :id) nil]`. Line 2368 was simply an oversight. The field id is irrelevant to what the test asserts (`fully_parameterized false`, driven by `:required true` with no `:default`), it only has to belong to the query's database.
+
+**Proof it is driver-agnostic — reproduced and fixed using H2 only, no MotherDuck anywhere.** Controlled A/B in identical JVMs: load a *different* H2 dataset first (`(mt/dataset daily-bird-counts (mt/id))`) so it claims `Database` id 1 and field ids 1..N, leaving H2 `test-data` as db 2 — the exact id skew, produced with two H2 databases.
+
+| | field 1 owner | `(mt/id)` | result |
+|---|---|---|---|
+| hardcoded `[:field 1 nil]` | db 1 `daily-bird-counts (h2)` | db 2 | ❌ `Invalid Field Filter: Field 1 "BIRD-COUNT"."ID" belongs to Database 1 "daily-bird-counts (h2)", but the query is against Database 2 "test-data (h2)"` |
+| `[:field (mt/id :venues :id) nil]` | db 1 `daily-bird-counts (h2)` | db 2 | ✅ passes |
+
+So **any** non-H2 driver whose `test-data` db is created before H2's hits this; motherduck is incidental. Also verified green standalone: `DRIVERS=motherduck ... :only metabase.collections-rest.api-test/fetch-root-items-fully-parameterized-field-filter-test` → 1 test, 2 assertions, 0 failures, 0 errors.
+
+**Blast radius of the same anti-pattern:** `grep -rn ":dimension *\[:field [0-9]" test enterprise/backend/test` — line 2368 was the only site combining a hardcoded field id with a `:dimension` template tag on an inserted Card. The other hits are pure data-transform tests (`legacy_mbql/*`) or `parameter_mappings` targets, neither of which is validated on insert. Hardcoded ids inside plain MBQL `:filter`/`:joins` (e.g. `queries_rest/api/card_test.clj:357,379,383`) are also harmless for the same reason. So this one line was the whole exposure.
+
+**No driver changes.** `motherduck.clj` untouched; `simplification.md` deliberately untouched (no override to vet). This fix is upstreamable on its own and should be PR'd to master independently of the MotherDuck work.
+
+**Gotcha for other agents:** repeatedly loading the remote motherduck `test-data` to reproduce ordering bugs can leave it half-populated; a later load then dies with `create-database! failed ... Duplicate key "id: 1" violates primary key constraint`. Reproduce app-DB-id-skew failures with two H2 datasets instead — faster, deterministic, offline, and it doubles as the proof that the bug is driver-agnostic.
+
+### 2026-08-01 — metabase.sync.sync-metadata.comments-test/sync-existing-table-comment-test — ✅ fixed (shared-test fix; zero lines added to `motherduck.clj` or the test adapter)
+
+**Assigned baseline (1 error):** `A result was returned when none was expected.`
+(`org.postgresql.util.PSQLException`, `PgStatement.checkNoResultUpdate:305`, reached via
+`clojure.java.jdbc/execute!` → `PgPreparedStatement.executeUpdate` from `comments_test.clj:146`).
+Reproduced first try.
+
+**Root cause — the known gateway quirk, but reaching *shared test code* for the first time.** The
+endpoint returns a result set for statement classes that `--compatibility-mode=metabase` does not
+suppress, and pgjdbc's `executeUpdate` rejects any result set outright. `COMMENT ON TABLE` is one of
+those classes. Measured live against `pg.staging-us-east-1-aws.motherduck.com`
+(`Statement.execute` → `true` means a result set came back):
+
+| statement | result set? | `executeUpdate` |
+|---|---|---|
+| `COMMENT ON TABLE` / `COMMENT ON COLUMN` | yes | error |
+| `DROP TABLE` | yes | error |
+| `SET SESSION TIMEZONE` | yes | error |
+| `UPDATE` | yes | error |
+| `CREATE TABLE` | no | ok |
+| `INSERT` | no | ok |
+| `CREATE OR REPLACE VIEW` | **no** | **ok** (newer than the driver comments claim — see `simplification.md`) |
+
+**What made this one test different is not the driver.** The other five tests in the namespace pass,
+including `table-comments-test` and `dont-overwrite-table-custom-description-test`, which exercise the
+*same* `sql.tx/standalone-table-comment-sql` — because the loader routes it through
+`execute/execute-sql!`, which the test adapter already overrides to raw `Statement.execute`. Only
+`sync-existing-table-comment-test` reached around that seam and called `jdbc/execute!` on the pooled
+connection spec directly. So the defect is the shared test bypassing the driver test-extension
+execution layer, which is also why it is enabled for only three hand-picked drivers.
+
+**Fix** (`test/metabase/sync/sync_metadata/comments_test.clj:145-160`): execute the comment DDL through
+the `execute/execute-sql!` test extension inside `do-with-connection-with-options`, instead of
+`jdbc/execute!`. Requires swapped 1:1 (`clojure.java.jdbc` + `sql-jdbc.connection` →
+`sql-jdbc.execute` + `test.data.sql-jdbc.execute`; both old ones were used at this call site only).
+**No `motherduck.clj` change and no test-adapter change** — the existing `execute-sql!` override does
+the work.
+
+Behaviour-preserving for the other three drivers that run this test: `execute-sql!
+:sql-jdbc/test-extensions` → `default-execute-sql!` is the same `jdbc/execute! ... {:transaction?
+false}` (trino still gets transactions off, as the original comment required), `:h2` delegates to that
+default, and `:starburst`'s `sequentially-execute-sql!` splits on `;` and delegates per statement —
+identical for a single statement.
+
+**Verification.** `:motherduck` target test green (1 assertion, 0 failures, 0 errors). Whole namespace
+green on **`:h2`** (6 tests, 6 assertions, 0/0) — the regression check that matters, since the edit is
+in shared code. No local postgres was available to run `:postgres`; it takes the unmodified
+`default-execute-sql!` path argued above.
+
+**One unrelated error seen at namespace scope on motherduck**, not caused by this change:
+`dont-overwrite-table-custom-description-test` errored with
+`Catalog Error: Catalog 'test-data' has been deleted` while the loader was inserting into `checkins`
+(`load_data.clj:269`). It passes standalone (1 assertion, 0/0). This is the shared-account
+catalog race between parallel vars, not a comment/result-set issue — the test is untouched by this fix.
+
+**Gateway axis.** Widens wishlist item 4: extend compat-mode result-set suppression to
+`COMMENT ON TABLE`/`COMMENT ON COLUMN` alongside DROP TABLE / SET / UPDATE. That would let this
+shared-test change be reverted *and* delete `drop-table!` plus the adapter's `execute-sql!` and
+`do-insert!` `SET` workarounds. The mechanism already exists — CREATE TABLE, INSERT and now
+CREATE VIEW pass through it cleanly.
+
+**Alternatives considered and rejected** (recorded because they bound the solution space for any
+future "gateway returns a result set" failure in shared test code):
+- *Return different SQL from `standalone-table-comment-sql :motherduck`* — the only driver-owned seam
+  in this code path, and the one `:starburst` uses. **Impossible:** `COMMENT ON` is DuckDB's only way
+  to set a comment, and no result-set-free statement class can set one. The test lets a driver control
+  the SQL string but hardcodes the execute method.
+- *Connection-level fix in `connection-details->spec`* — **tried and failed.** Probed
+  `preferQueryMode=simple` and `=extendedForPrepared`: the gateway returns the result set in every
+  protocol mode. Smuggling clojure.java.jdbc opts (e.g. `:return-keys`, which would switch
+  `execute!` off the `executeUpdate` path) through the spec is also impossible — `create-pool!`
+  returns only `{:datasource ...}` plus whitelisted ssh-tunnel keys.
+- *Disable `::table-comments-sync` for `:motherduck`* — 3 lines, but it would also skip
+  `table-comments-test` and `dont-overwrite-table-custom-description-test`, which currently pass and
+  are the only coverage of the `comment AS description` column in the motherduck-specific
+  `describe-database*`. Hiding a working feature to dodge a harness limitation.
+- *Return a proxy `PreparedStatement` from `standalone-table-comment-sql`* — clojure.java.jdbc does
+  accept one and `executeUpdate` could be reified onto `.execute`, but that is ~10 obscure adapter
+  lines and the statement would hold a connection the test's `with-open` does not own.
+
+**Side finding worth its own experiment** (logged in `simplification.md`): under
+`preferQueryMode=simple`, `SELECT ? AS a` with `setString` succeeds instead of raising "ambiguous
+result column types". That is the whole error class the `->honeysql String` cast and the
+`:convert-timezone` override exist for — a possible one-line client-side substitute for gateway
+wishlist item 3. Not adopted here; it gives up server-side prepared statements and needs its own
+type-fidelity/injection review.
+
+### metabase.driver.sql-jdbc-test/rename-tables-test + metabase.driver-test/table-exists-test — ✅ 2 tests, 15 assertions, 0 fail/err (2026-08-01)
+
+13 errors in the 2026-07-27 full run (11 in `rename-tables-test`, 2 in `table-exists-test`), all with
+the same cause:
+
+```
+ERROR: Out of Memory Error: failed to pin block of size 256.0 KiB (47.5 MiB/47.6 MiB used)
+  at org.postgresql.jdbc.PgDatabaseMetaData.getPrimaryKeys
+  <- sql_jdbc.sync.describe_table/add-table-pks <- describe-table* <- driver/table-exists?
+```
+
+**Root cause — the pgjdbc `getPrimaryKeys` query shape, not a leak and not staging capacity.**
+`driver/table-exists?` has no `:motherduck` override, so it falls to the `::driver` default: run
+`describe-table` and check whether it returned fields. The `:sql-jdbc` `describe-table` does two JDBC
+metadata calls — `.getColumns` (fine over the gateway) and `.getPrimaryKeys` via
+`sql-jdbc.describe-table/get-table-pks`. pgjdbc's `getPrimaryKeys` SQL self-joins `pg_class`
+(`ct` and `ci`), joins `pg_attribute`/`pg_namespace`/`pg_index`, projects
+`information_schema._pg_expandarray(i.indkey)` and then filters the wrapping subquery on
+`result.A_ATTNUM = (result.KEYS).x`. DuckDB plans that shape pathologically.
+
+Live probes against `pg.staging-us-east-1-aws.motherduck.com` (2026-07-29 to 2026-08-01), each on a
+brand-new connection, ruled out every non-driver explanation:
+
+- **Not accumulation / a leaked statement / pool state.** The OOM is the *first statement of a fresh
+  connection*, reproducible 3/3 in a loop of open-connect-call-close.
+- **Not data volume.** The catalog it runs against has 56 `pg_class` rows, 727 `pg_attribute` rows and
+  an **empty** `pg_index` — every prefix of the join returns 0 rows in ~200 ms. The failing query
+  therefore produces 0 rows and still exhausts memory.
+- **Not concurrent load on shared staging.** Reproduced identically at idle; the `47.6 MiB` in the
+  message is the instance's static `memory_limit` (`duckdb_settings()`: `memory_limit=47.6 MiB`,
+  `threads=1`), not a fluctuating headroom figure.
+- **Isolated to one column.** Bisecting the outer select list: `TABLE_CAT`, `TABLE_SCHEM`,
+  `TABLE_NAME`, `COLUMN_NAME`, `KEY_SEQ` each return 0 rows in ~250 ms; adding **`PK_NAME`**
+  (`ci.relname`, the second `pg_class` alias) is what OOMs. A plain `pg_class` self-join projecting
+  both `relname`s is fine, so it is the interaction of the second alias with the
+  `_pg_expandarray`/`(KEYS).x` subquery, not `pg_class` itself.
+
+**Fix** (`motherduck.clj`, one `def` + one 6-line `defmethod`): override
+`sql-jdbc.describe-table/get-table-pks :motherduck` to read PKs from `duckdb_constraints()`:
+
+```sql
+SELECT unnest(constraint_column_names) FROM duckdb_constraints()
+ WHERE database_name = current_database() AND constraint_type = 'PRIMARY KEY'
+   AND schema_name = ? AND table_name = ?
+```
+
+Verified live: multi-column PK `(b, a)` comes back in declaration order `["b" "a"]` (matching
+`information_schema.key_column_usage.ordinal_position`), a nonexistent table returns `[]`, and the
+`?` params bind without the usual "ambiguous types" complaint (they are compared against varchar
+catalog columns, so the type is inferable). Uses `duckdb_*` per AGENTS.md's introspection preference.
+
+**Vetting.**
+- *Does a test fail without it?* Yes — the 13 errors above; both target tests now pass (15 assertions).
+- *Existing-driver precedent?* Yes, and it is the standard escape hatch: `:oracle`, `:snowflake` and
+  `:clickhouse` all override `get-table-pks` precisely because their JDBC `getPrimaryKeys` misbehaves.
+- *Blast radius?* `get-table-pks` is only reachable on `:motherduck` through `describe-table`
+  (`table-exists?`, `test.data.impl.verify`, and the sync fallback that `:describe-fields` drivers
+  never take) and through `describe-nested-field-columns` (`:nested-field-columns` is disabled).
+  Regular sync is untouched: the inherited `describe-fields-sql` derives `pk?` from
+  `information_schema.table_constraints ⋈ key_column_usage`, which already works.
+
+**Alternatives considered.**
+- *Override `driver/table-exists?`* (precedent: `:bigquery-cloud-sdk`, `:snowflake`, `:sqlserver`) with
+  a `duckdb_tables()`/`duckdb_views()` lookup. Same line count, one fewer round trip, but it only
+  routes *around* the break: `describe-table` would stay broken for `verify-data-loaded-correctly` and
+  any future caller. Fixing the broken primitive dominates for equal cost.
+- *Return `[]` from `get-table-pks`* (what `:clickhouse` does under `is-test?`). Passes the tests —
+  nothing on `:motherduck` currently asserts describe-table PKs — but it is a lie, and `duckdb_constraints()`
+  gives the true answer for the same number of lines.
+- *Raise the memory limit* (`SET memory_limit=...` in `connection-details->spec`). Rejected: the query
+  returns 0 rows, so no limit is "enough" in a principled sense; it would paper over a planner
+  pathology with a per-connection setting the gateway may not honor anyway.
+
+**Gateway axis: worth reporting, does not delete this override.** DuckDB's planner blows up on
+pgjdbc's stock `getPrimaryKeys` SQL — a query every JDBC client and metadata-browsing tool issues, so
+it will bite non-Metabase users too. Even fixed, `duckdb_constraints()` remains the cheaper path
+(one scan vs. a five-way `pg_catalog` join), so this override stays. Related: `_pg_expandarray` is
+also the reason `:describe-indexes` is off (see `simplification.md`).
+
+### 2026-08-01 — metabase.query-processor.timezones-test/filter-test — ✅ 4/4 standalone runs clean; assigned failure is environmental, NOT reproducible (zero code changes)
+
+**Assigned baseline (fresh full-suite run):** error during *test-data setup*, not the test body —
+`Error loading data: INSERT FAILED: An I/O error occurred while sending to the backend`
+← `org.postgresql.util.PSQLException` ← `java.net.SocketException: Connection reset`, thrown from
+`load-data/do-insert!` (`modules/drivers/motherduck/test/metabase/test/data/motherduck.clj:195`) via
+`create-db-load-data!` / `load-data-for-table-definition!`
+(`test/metabase/test/data/sql_jdbc/load_data.clj:255`) while executing a 200-row multi-VALUES
+`INSERT INTO "orders"`. Not present in the original triage baseline, so it was new or intermittent.
+
+**Verdict: not reproducible. Four consecutive standalone runs passed** — `4 assertions, 0 failures,
+0 errors` each, in 41.4 s / 40.6 s / 39.2 s / 39.8 s
+(`DRIVERS=motherduck ... :only metabase.query-processor.timezones-test/filter-test`, against
+`MB_MOTHERDUCK_TEST_HOST=pg.staging-us-east-1-aws.motherduck.com`).
+
+**The passes are meaningful — the failing code path really was exercised every time.** The obvious
+worry is that `tx/dataset-already-loaded? :motherduck` short-circuited the load and the runs never
+touched `do-insert!` at all. Ruled out directly: `tx/after-run :motherduck` drops every database in
+`created-databases`, and a `psql` check between runs confirmed `tz-test-data` was **absent** from
+`duckdb_databases()`, so each run had to recreate and reload it from scratch. Polling the gateway
+(read-only `duckdb_tables()`) *during* a run captured the load in progress:
+
+```
+22:57:18 exists=0
+22:57:23 users=15 categories=75 venues=100 checkins=1000 products=200 people=600  reviews=0    orders=0
+22:57:27 users=15 categories=75 venues=100 checkins=1000 products=200 people=2500 reviews=600  orders=0
+22:57:32 ...                                                                       reviews=1112 orders=4800
+22:57:37 ...                                                                                    orders=10400
+22:57:42 ...                                                                                    orders=15800
+22:57:46 ...                                                                                    orders=18760
+22:57:51 exists=0            <- after-run DROP DATABASE
+```
+
+So all 23,762 rows of `test-data` load on every run, `orders` (18,760 rows = 94 chunks of 200) in
+~15 s ≈ 160 ms per 200-row INSERT, and the whole dataset in ~28 s. The exact statement shape that
+failed in the suite succeeds ~94 times in a row, four runs running, when the account is uncontended.
+
+**Why it is environmental, not a statement-size / payload limit.** Ruled out the size hypothesis:
+`load-data/chunk-size :motherduck` is already 200 (`motherduck.clj:171`, added because the inherited
+Postgres single-INSERT-per-table impl blows the pgjdbc 65,535-parameter cap). A 200-row × 10-column
+`orders` chunk binds ~2,000 parameters — far under that cap — and demonstrably round-trips fine.
+Three further points make a gateway/capacity story the better fit than anything about this test:
+1. `orders` is the **last** of 8 tables loaded (`test-data.edn` order: users, categories, venues,
+   checkins, products, people, reviews, orders), on a connection that has already been open for
+   ~15 s and pushed ~5,000 rows. Failure position correlates with connection age/volume, not with
+   the statement.
+2. The identical error is already logged in this file for a **different** table in a **different**
+   namespace (`metabase.warehouses.models.database-test`, `check-health!-test` — "a transient
+   `Connection reset` / `INSERT FAILED: An I/O error occurred while sending to the backend` while
+   loading the `people` table"). Same symptom, different statement ⇒ not statement-shape-specific.
+3. The staging instance is tiny and shared: `memory_limit`/`max_memory` = **47.6 MiB**, `threads` = 1
+   (see the `get-table-pks` entry). Under a full-suite run (`multithread? :vars`, many namespaces
+   creating/loading/dropping databases concurrently on one account) the backend dropping a socket is
+   a capacity symptom, and it only ever shows up in full-suite runs — never standalone.
+
+**No code changes. Deliberately did not add retry/backoff**, per the AGENTS.md vetting questions.
+Precedent for retrying in test-data loading does exist (`bigquery-cloud-sdk` retries `insert-data!`
+up to 5×; `redshift` retries its `dataset-already-loaded?` probe once, both in their test extensions,
+and `u/auto-retry` in `src/metabase/util/jvm.clj:182` is the generic mechanism — nothing currently
+wraps `create-db!`), so it would not be a *novel* pattern. It still fails the vetting bar: no test
+fails without it (4/4 green), there is no established root cause for it to target, and it would add
+code to the test adapter to mask a shared-staging-account capacity issue — trading a loud, honest
+failure for silently doubled load against the very instance that is already the bottleneck. If this
+recurs often enough to block suite runs, the right fixes are environmental (a bigger/dedicated
+staging instance, or lower suite concurrency against MotherDuck), not driver or adapter code.
+
+**Pattern for other agents:** `INSERT FAILED: An I/O error occurred while sending to the backend` /
+`SocketException: Connection reset` during `create-db-load-data!` is a **known full-suite-only flake
+class** on this account — treat it as collateral damage and re-run standalone before investigating.
+When you do, verify the load actually ran rather than trusting a green result: `tz-test-data` and
+friends are dropped by `after-run`, but `dataset-already-loaded?` only probes the dbdef's **first**
+table, so a run that dies partway through (exactly what this failure does — it dies on `orders`, the
+last table) can leave a database that reports "already loaded" while missing most of its rows. A
+fast standalone pass (~40 s here) is *not* by itself evidence the load was skipped; confirm with a
+read-only `duckdb_databases()` / `duckdb_tables()` probe over psql using the test env vars.
+
+### 2026-08-02 — metabase.usage-metadata.batch-test/run-batch!-integration-test — ✅ fixed, but NOT a driver bug (one-line upstream test-isolation fix; no `motherduck.clj` change)
+
+**Assigned as** an H2 unique-constraint violation on the **application** database, not MotherDuck:
+
+```
+Unique index or primary key violation: "PUBLIC.PRIMARY_KEY_49 ON PUBLIC.QUERY(QUERY_HASH)
+  VALUES ( CAST(X'2b2781ff…df51' AS BINARY(32)) )"
+SQL statement: INSERT INTO "QUERY" ("QUERY_HASH", "QUERY", "AVERAGE_EXECUTION_TIME") VALUES (?, ?, ?)
+-- row being inserted: {"database":2,"type":"native","native":{"query":"SELECT 1"}}
+```
+
+Evidence came from the full-suite run that finished 2026-08-01 23:25 (`metabase.usage_metadata.batch_test.xml`, timestamp `2026-08-02T03:22:34Z`): **41 tests, 0 failures, 1 error** — this var was the only one erroring in the namespace.
+
+**Not driver-specific.** This namespace has no `mt/test-driver(s)` / `driver/with-driver` anywhere (`grep` returns zero hits), so `tx/driver` → `(or driver/*driver* :h2)` → H2 — same class as the 2026-07-29 `warehouse-schema-rest.api.table-test` and 2026-08-01 `collections-rest.api-test` entries above. Zero lines of MotherDuck code execute in the failure path; the whole test runs against the H2 app DB plus H2 `test-data` metadata. `:database 2` is the usual id skew (motherduck `test-data` loads first and takes `Database` id 1, H2 `test-data` becomes 2) and is incidental — it changes the hash *value*, not the outcome.
+
+**Root cause.** `application_db.query` is a **global dedup table keyed by a content hash of the query** (`t2.model/primary-keys :model/Query` → `[:query_hash]`, `src/metabase/queries/models/query.clj:24`), not scoped per test. Its hash is `lib-be.hash/query-hash`, which normalizes to canonical MBQL before hashing — so a legacy `{:database N :type :native :native {:query "SELECT 1"}}` and any equivalent MBQL-5 native query collapse to the *same* row. The test's private helper `insert-query!` used a bare `t2/insert!`, so it assumed it was the only writer of that hash. It is not: the QP's own writer, `query/save-queries-and-update-average-execution-times!` (`query.clj:156-185`), inserts the identical row for every userland execution — and deliberately swallows the conflict in a savepoint (`"A conflict means someone else just inserted one of these hashes"`). So the production path is conflict-tolerant by design and the test was the only intolerant writer.
+
+The polluter is therefore **any** earlier test in the same JVM that executed native `SELECT 1` against `(mt/id)` through the userland QP — of which there are many (`grep -rln '"SELECT 1"' test enterprise/backend/test` → 71 files). Worse, `save-execution-metadata!` batches on a 20-second grouper thread (`process_userland_query.clj:44,70-89`), so the row can land at an arbitrary later moment, which is why this presents as intermittent rather than deterministic.
+
+**Fix** (`test/metabase/usage_metadata/batch_test.clj:67-77`, 1 statement + comment): clear the hash before inserting.
+
+```clojure
+(t2/delete! :model/Query :query_hash query-hash)
+(t2/insert! :model/Query {...})
+```
+
+Vetting: every `deftest` in the file already calls `delete-query!` on exactly these hashes in its `finally`, so the end state is **unchanged** — the delete only stops the insert from throwing. Putting it in the shared private helper covers all 8 call sites for one statement. This mirrors what the production writer already does (tolerate a pre-existing row rather than assume ownership).
+
+**Proof it is driver-agnostic — reproduced and fixed with H2 only, no MotherDuck anywhere.** Script run under `clojure -M:dev:drivers:drivers-dev:test -i` (note `-M`, so hawk never runs and `target/junit` is not wiped), single JVM, three phases:
+
+| phase | app-db state | result |
+|---|---|---|
+| 1. run var on clean app db | no `query` row for the hash | ✅ `{:test 1, :pass 10, :fail 0, :error 0}` |
+| 2. one userland `SELECT 1` against `(mt/id)` | 1 row now owned by the QP | — |
+| 3. re-run the same var | row pre-exists | ❌ `PUBLIC.PRIMARY_KEY_49 ON PUBLIC.QUERY(QUERY_HASH)` — identical signature |
+
+Same constraint, same table, same SQL; only the hash differs (`50a5ea…` with `(mt/id)`=1 here vs `2b2781…` with `(mt/id)`=2 in the suite), which independently confirms that the database id is part of the hashed input. Phase 2 used `qp.util/*execute-async?* false` to make the grouper write synchronously. After the fix, the faithful single-run scenario (pollute first, then run the var **once**, as the suite does) passes: `{:test 1, :pass 10, :fail 0, :error 0}`.
+
+**Alternatives considered and rejected.**
+- *Add anything to `motherduck.clj`* — rejected outright: no MotherDuck code is on the failure path, so a driver-level change could only mask a driver-agnostic bug. Same reasoning as the two precedents above.
+- *Use `mt/with-temp` for the `:model/Query` rows* — does not help. `with-temp` rolls back on exit but still issues the same bare INSERT on entry, so it collides identically. The collision is about *pre-existing global state*, not cleanup.
+- *Make the test tolerate the conflict (try/catch around the insert)* — worse: it would leave the other test's `average_execution_time` in place, and `run-batch!` reads `query.query` back, so the test would silently assert against a foreign row.
+- *Change `insert-query!` to an upsert / `t2/update-or-insert!`* — more code for the same end state, and the `finally` deletes the row regardless, so the extra generality buys nothing.
+- *Randomize the query text so hashes never collide* — would work, but changes what the test exercises (`native-query` exists precisely to cover the "stored native query" path) and leaves the identical latent bug in the other 7 call sites.
+
+**Secondary latent issue found, deliberately NOT fixed (out of scope, does not affect the suite).** `missing-hash` / `unsupported-hash` / `bad-hash` are short literal byte arrays (`(.getBytes "unsupported-query")` = 17 bytes). `query.query_hash` is `BINARY(32)`, so H2 zero-pads them on insert, and the matching `t2/delete!` with the *unpadded* 17-byte array then never matches — verified directly: insert, delete, and the row is still there. These rows therefore leak one per JVM, which makes the namespace non-idempotent if a var is ever run twice in one JVM (that is how phase 3 above surfaced a *second* collision once the first was fixed). The suite runs each var once, so it is currently harmless; fixing it would mean padding the literals to 32 bytes, which is a separate change.
+
+**No driver changes.** `motherduck.clj` untouched; test adapter untouched; `simplification.md` deliberately untouched (no override to vet). Like the `collections-rest` entry, this fix is upstreamable on its own and should be PR'd to master independently of the MotherDuck work.
+
+**Verification.** `DRIVERS=motherduck … :only metabase.usage-metadata.batch-test/run-batch!-integration-test` → **1 test, 10 assertions, 0 failures, 0 errors**; whole namespace → **9 tests, 50 assertions, 0 failures, 0 errors**.
+
+**Gotcha for other agents:** a full-suite run was still in flight when this task started (`ps aux | grep "[j]ava"` showed a live `clojure.run.exec`), and hawk's `clean-output-dir!` deletes all of `target/junit` at the start of every `-X …:test` run. The 2026-08-01 full-suite results were archived out of `target/` first and restored afterwards, along with the 174-row `junit-failures.jsonl` — check for a live JVM *and* archive before running anything. To probe the app DB without touching `target/junit` at all, run a script under `clojure -M…:test -i script.clj`: the `:test` alias defines only `:exec-fn` (no `:main-opts`), so `-M` never invokes hawk.
