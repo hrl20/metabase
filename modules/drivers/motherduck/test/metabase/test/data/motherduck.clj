@@ -16,6 +16,10 @@
    [metabase.driver.sql-jdbc.sync.describe-table-test :as describe-table-test]
    [metabase.test :as mt]
    [metabase.test.data.interface :as tx]
+   ;; The `row-xform` method below uses the `:postgres` method. That method is available only after
+   ;; Clojure loads this namespace. A `DRIVERS=motherduck` test run does not load the Postgres test
+   ;; extensions.
+   [metabase.test.data.postgres]
    [metabase.test.data.sql :as sql.tx :refer [qualify-and-quote]]
    [metabase.test.data.sql-jdbc.execute :as execute]
    [metabase.test.data.sql-jdbc.load-data :as load-data]
@@ -161,9 +165,17 @@
 (defmethod sql.tx/generated-column-sql :motherduck [_ expr]
   (format "GENERATED ALWAYS AS (%s)" expr))
 
+;; This method combines two transducers. The first transducer makes the id values, because DuckDB
+;; does not have the SERIAL type. Refer to `pk-sql-type`. The second transducer is the Postgres
+;; transducer. It puts each `:type/JSON` value into a `CAST(? AS json)` expression. Then the value
+;; goes into the column as JSON and not as text. DuckDB can also cast the VARCHAR parameter
+;; automatically. But the explicit cast gives the parameter type to the gateway. Without the cast,
+;; the gateway cannot find the type of the `?` parameter in an INSERT statement. The gateway has
+;; this limitation for all statements in this driver.
 (defmethod load-data/row-xform :motherduck
-  [_driver _dbdef tabledef]
-  (load-data/maybe-add-ids-xform tabledef))
+  [driver dbdef tabledef]
+  (comp (load-data/maybe-add-ids-xform tabledef)
+        ((get-method load-data/row-xform :postgres) driver dbdef tabledef)))
 
 ;; The Postgres impl loads each table in a single INSERT, but the Postgres JDBC driver caps a
 ;; prepared statement at 65,535 parameters, which bigger tables (e.g. sample-dataset `orders`)

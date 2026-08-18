@@ -33,6 +33,7 @@ driver:
         - default: true
     - ssh-tunnel
     - advanced-options-start
+    - json-unfolding
     - merge:
         - additional-options
         - placeholder: "prepareThreshold=0"

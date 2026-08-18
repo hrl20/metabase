@@ -10,7 +10,9 @@
    ;; ensure the driver (and its parent) are registered
    metabase.driver.motherduck
    [metabase.driver.motherduck-test.util :as motherduck-test.util]
-   [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]))
+   [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+   [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.util.honey-sql-2 :as h2x]))
 
 (defn- test-details
   "Connection details for the live MotherDuck pg endpoint. Host is fixed to the us-east-1 endpoint;
@@ -22,6 +24,30 @@
    :user     (or (not-empty (System/getenv "MB_MOTHERDUCK_TEST_USER")) "metabase")
    :password (motherduck-test.util/motherduck-token)
    :ssl      true})
+
+;; This test only compiles SQL. It does not need a connection to the database. The
+;; `metabase.driver.mysql-test/json-query-test` and `metabase.driver.postgres-test/json-query-test`
+;; tests have the same structure. This test makes sure that the driver keeps the DuckDB JSON syntax.
+;; The parent driver cannot make this syntax. The driver uses the `json_extract_string` function
+;; with an inline JSONPath. It does not use the Postgres `#>>` operator with a `text[]` array.
+(deftest ^:parallel json-query-test
+  (let [identifier (h2x/identifier :field "boop" "bleh -> meh")]
+    (testing "a nested field reference compiles to json_extract_string with an inlined JSONPath"
+      (are [field expected] (= [expected]
+                               (sql.qp/format-honeysql :motherduck (sql.qp/json-query :motherduck identifier field)))
+        {:nfc-path [:bleh :meh] :database-type "text"}
+        "CAST(JSON_EXTRACT_STRING(\"boop\".\"bleh\", '$.\"meh\"') AS text)"
+
+        ;; The code changes the `decimal` type to `double`. In DuckDB, a `DECIMAL` type without
+        ;; parameters truncates the value.
+        {:nfc-path [:bleh :meh] :database-type "decimal"}
+        "CAST(JSON_EXTRACT_STRING(\"boop\".\"bleh\", '$.\"meh\"') AS double)"
+
+        {:nfc-path [:bleh "boop" :foobar 1234] :database-type "boolean"}
+        "CAST(JSON_EXTRACT_STRING(\"boop\".\"bleh\", '$.\"boop\".\"foobar\".\"1234\"') AS boolean)"
+
+        {:nfc-path [:bleh "meh"] :database-type "timestamp"}
+        "CAST(JSON_EXTRACT_STRING(\"boop\".\"bleh\", '$.\"meh\"') AS timestamp)"))))
 
 (deftest connection-spec-forces-sslmode-require-test
   (testing "the :motherduck connection spec forces sslmode=require"

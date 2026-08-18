@@ -94,7 +94,6 @@
                  ;; LEVEL SECURITY`, inherited from `:postgres`) doesn't work against the MotherDuck gateway.
                  :test/rls-impersonation
                  :test/column-impersonation
-                 :nested-field-columns
                  ;; FKs can be *read* (see describe-fks-sql), but the test-data loader can't create
                  ;; them (DuckDB has no `ALTER TABLE ... ADD FOREIGN KEY`), so disable FK sync for now.
                  :metadata/key-constraints
@@ -247,6 +246,48 @@
 (defmethod sql.qp/transform-literal-like-pattern-honeysql :motherduck
   [_driver like-rhs-honeysql]
   [:escape like-rhs-honeysql [:inline "\\"]])
+
+;; JSON unfolding. The `:motherduck` driver gets `:nested-field-columns` as `true` from the
+;; `:postgres` driver. The `driver.common/json-unfolding-default` function gives this value.
+;;
+;; Postgres reads an unfolded field with `(parent #>> (array['a', 'b']::text[]))::type`. The
+;; `format-json-query` function in `metabase.driver.postgres` makes this SQL. DuckDB does not have
+;; the `#>>` operator. DuckDB also does not have `text[]` path arrays. The equivalent DuckDB
+;; function is `json_extract_string(parent, '$."a"."b"')`. This function gives the value as a
+;; VARCHAR without quotation marks. For an array or an object, this function gives the JSON text.
+;; The `#>>` operator gives the same JSON text. The `:mysql` driver has the same problem and uses
+;; the same solution. That driver also replaces the Postgres operator with a JSONPath function.
+;;
+;; The code puts the path into the SQL with `[:inline ...]`. It does not send the path as a
+;; parameter. At prepare time, the gateway cannot find the type of a bare `?` in the argument list
+;; of a scalar function. Refer to the note about `->honeysql [:motherduck String]`.
+(def ^:private json-cast-types
+  "A map of database types. Each key is the `:database-type` of an unfolded field. The
+  `sql-jdbc.describe-table/db-type-map` map gives these types. Each value is the DuckDB type for the
+  cast of the extracted value.
+
+  Only the `decimal` type needs a different value. In DuckDB, a `DECIMAL` type without parameters is
+  the same as `DECIMAL(18,3)`. This type truncates JSON numbers and gives no error. For example, it
+  changes `1.4466014248940077e9` to `1446601424.894`. The Postgres `decimal` type has unlimited
+  precision. The `:mysql` driver uses `double` for the same reason. The `double` type keeps all the
+  numbers that Jackson gives for a `:type/Number` nfc column.
+
+  The `text`, `boolean` and `timestamp` types are correct DuckDB type names. The code does not
+  change them. For example, `CAST('2012-04-23T18:44:43.511Z' AS TIMESTAMP)` reads the ISO-8601 JSON
+  date and time values in these columns."
+  {"decimal" "double"})
+
+(defmethod sql.qp/json-query :motherduck
+  [_driver unwrapped-identifier nfc-field]
+  {:pre [(h2x/identifier? unwrapped-identifier)]}
+  (let [field-type (:database-type nfc-field)
+        nfc-path   (:nfc-path nfc-field)
+        json-path  (apply str "$" (for [k (rest nfc-path)]
+                                    (format ".\"%s\"" (if (number? k) k (name k)))))]
+    (h2x/cast (get json-cast-types field-type field-type)
+              [:json_extract_string
+               (sql.qp.u/nfc-field->parent-identifier unwrapped-identifier nfc-field)
+               [:inline json-path]])))
 
 ;; Postgres compiles `:regex-match-first` to `substring(expr FROM pattern)` — a Postgres-only
 ;; two-arg POSIX-regex overload of `substring`. DuckDB's `substring` has no such overload (only
