@@ -885,11 +885,8 @@
            events
            lib
            lib-be
-           models
            premium-features
-           public-settings
            query-processor
-           secrets
            settings
            sql-tools
            system
@@ -1495,7 +1492,6 @@
            metabase.models.init
            metabase.models.interface
            metabase.models.resolution
-           metabase.models.secret
            metabase.models.serialization
            metabase.models.serialization.resolve
            metabase.models.serialization.resolve.mp
@@ -2140,7 +2136,7 @@
 
   secrets
   {:team "Graphy"
-   :api  #{metabase.secrets.core metabase.secrets.models.secret}
+   :api  #{metabase.secrets.core}
    :uses #{api driver models premium-features util}
    :model-exports #{:model/Secret}}
 

@@ -89,6 +89,11 @@
                  :persist-models
                  :database-routing
                  :connection-impersonation
+                 ;; DuckDB has no row-level security or role-based GRANTs, so the connection-impersonation
+                 ;; test infra's role setup/teardown (`tx/with-temp-roles!` -> `ALTER TABLE ... DISABLE ROW
+                 ;; LEVEL SECURITY`, inherited from `:postgres`) doesn't work against the MotherDuck gateway.
+                 :test/rls-impersonation
+                 :test/column-impersonation
                  :nested-field-columns
                  ;; FKs can be *read* (see describe-fks-sql), but the test-data loader can't create
                  ;; them (DuckDB has no `ALTER TABLE ... ADD FOREIGN KEY`), so disable FK sync for now.
