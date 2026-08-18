@@ -158,9 +158,10 @@
     (mt/with-temp-copy-of-db
       (let [db (mt/db)
             db-spec (sql-jdbc.conn/db->pooled-connection-spec db)]
-        ;; `with-temp-copy-of-db` only copies Table/Field metadata -- it reuses the same physical connection details
-        ;; as the original DB, so raw DDL here mutates the real, shared underlying database. Drop the table
-        ;; afterwards so we don't leak it into the connection shared by every other test in the run.
+        ;; The `with-temp-copy-of-db` macro copies only the Table metadata and the Field metadata. The
+        ;; copy keeps the connection details of the initial database. Therefore the DDL statements below
+        ;; change the real database. All other tests in the run use that same database. Drop the table at
+        ;; the end to keep the database clean.
         (try
           (doseq [statement ["DROP TABLE IF EXISTS \"base_type_change_test\";"
                              "CREATE TABLE \"base_type_change_test\" (\"string_tbc_int_col\" VARCHAR);"
@@ -169,15 +170,11 @@
           (sync/sync-database! db)
           (let [field (t2/select-one [:model/Field :id] :name "string_tbc_int_col")]
             (mt/user-http-request :crowberto :put 200 (format "field/%d" (:id field)) {:coercion_strategy :Coercion/String->Integer})
-
             (sync/sync-database! db)
-
             (is (=? {:effective_type :type/Integer :coercion_strategy :Coercion/String->Integer}
                     (t2/select-one :model/Field :name "string_tbc_int_col")))
-
             (jdbc/execute! db-spec ["ALTER TABLE \"base_type_change_test\" ALTER COLUMN \"string_tbc_int_col\" TYPE int USING \"string_tbc_int_col\"::integer;"])
             (sync/sync-database! db)
-
             (is (=? {:coercion_strategy nil}
                     (t2/select-one :model/Field :name "string_tbc_int_col"))))
           (finally

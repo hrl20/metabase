@@ -232,8 +232,9 @@
   (try
     (let [decl    (ns.file/read-file-ns-decl file)
           ns-symb (ns.parse/name-from-ns-decl decl)]
-      ;; `file` might not actually be a namespace source file at all (e.g. a stray non-Metabase `project.clj`
-      ;; living somewhere under the scanned source roots) -- skip it rather than crashing the whole scan.
+      ;; The `file` value can be a file that is not a namespace source file. For example, a
+      ;; non-Metabase `project.clj` file can be in one of the scanned source directories. Skip such a
+      ;; file. Do not stop the scan.
       (when ns-symb
         (let [static-deps  (ns.parse/deps-from-ns-decl decl)
               dynamic-deps (for [symb (find-dynamically-loaded-namespaces file)]

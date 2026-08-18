@@ -1,19 +1,20 @@
 (ns metabase.driver.motherduck
   "MotherDuck driver.
 
-  MotherDuck speaks the Postgres wire protocol, so this driver reuses the Postgres JDBC client and
-  the Postgres driver's query-execution behavior by parenting on `:postgres`. The one thing that is
-  *not* Postgres-compatible is the catalog: the backend is DuckDB, and a single connection can see
-  many databases. Sync/metadata multimethods are therefore overridden here to use DuckDB `duckdb_*`
-  metadata functions scoped to `database_name = current_database()`, which cleanly excludes the
-  `system`/`temp` databases and all built-in/internal objects.
+  MotherDuck speaks the Postgres wire protocol. Therefore this driver derives from the `:postgres`
+  driver. It uses the Postgres JDBC client and the query execution of the Postgres driver.
 
-  See PLAN.md (phases T5/§4/§5) for the validated rewrite SQL and the DuckDB type map."
+  The catalog is not Postgres-compatible. The database engine is DuckDB, and one connection can see
+  many databases. Therefore the methods for sync and metadata below use the DuckDB `duckdb_*`
+  metadata functions. These methods add a `database_name = current_database()` condition. That
+  condition removes the `system` and `temp` databases and all internal objects.
+
+  Refer to PLAN.md (phases T5/§4/§5) for the SQL and the DuckDB type map."
   (:require
    [clojure.string :as str]
    [honey.sql :as sql]
    [metabase.driver :as driver]
-   ;; ensure the parent driver is loaded before we register against it
+   ;; Load the parent driver first. The registration below needs the parent driver.
    metabase.driver.postgres
    [metabase.driver.sql-jdbc :as sql-jdbc]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
@@ -39,30 +40,32 @@
 
 (defmethod sql-jdbc.conn/connection-details->spec :motherduck
   [_driver details]
-  ;; MotherDuck's Postgres endpoint (pg.<region>-aws.motherduck.com:5432) *requires* an encrypted
-  ;; connection; a plaintext attempt just hangs until the client times out. Force SSL on and use
-  ;; `sslmode=require`, which encrypts the connection but does NOT attempt to verify the server
-  ;; certificate or hostname.
+  ;; The MotherDuck Postgres endpoint (pg.<region>-aws.motherduck.com:5432) requires an encrypted
+  ;; connection. A connection without encryption does not answer, and the client stops at its time
+  ;; limit. Therefore this method sets SSL on and sets `sslmode=require`. That mode encrypts the
+  ;; connection. It does not examine the server certificate or the host name.
   ;;
-  ;; `verify-full` (encrypt + validate the cert chain and hostname against the JVM trust store) was
-  ;; tried first but the connection would hang/time out against the MotherDuck endpoint. `require` is
-  ;; confirmed working with the Postgres JDBC driver against MotherDuck, so we start there.
+  ;; The `verify-full` mode encrypts the connection and also examines the certificate chain and the
+  ;; host name against the JVM trust store. A test of that mode against the MotherDuck endpoint also
+  ;; did not answer. The `require` mode operates correctly with the Postgres JDBC driver against
+  ;; MotherDuck.
   ;;
-  ;; Passing `:ssl true` to the Postgres `connection-details->spec` already yields `sslmode=require`
-  ;; when no explicit ssl-mode is set; we set it explicitly here to be unambiguous.
+  ;; A `:ssl true` detail alone gives `sslmode=require` in the Postgres `connection-details->spec`
+  ;; method when no ssl-mode is set. This method sets `sslmode` again to make the value clear.
   ;;
-  ;; `options=--compatibility-mode=metabase` is forwarded to the gateway as a startup packet option
-  ;; (like `PGOPTIONS`), opting the connection into MotherDuck-gateway code paths written specifically
-  ;; for Metabase (e.g. quoting array elements the way real Postgres does).
+  ;; The gateway receives `options=--compatibility-mode=metabase` as a startup packet option, which
+  ;; is equivalent to `PGOPTIONS`. This option selects the MotherDuck gateway code paths for
+  ;; Metabase. For example, those code paths put quotation marks around array elements in the same
+  ;; way as real Postgres.
   (-> (sql-jdbc.conn/connection-details->spec :postgres (assoc details :ssl true))
       (assoc :sslmode "require"
              :options "--compatibility-mode=metabase")))
 
-;; Real Postgres signals "table does not exist" with SQLSTATE `42P01`; the Postgres impl of
-;; `impl-table-known-to-not-exist?` checks for exactly that. MotherDuck's gateway forwards DuckDB's own
-;; "Catalog Error" for the same condition without that SQLSTATE, so the Postgres check never matches and
-;; the exception propagates instead of `driver/table-exists?` returning `false`. Match on the DuckDB
-;; catalog error text instead.
+;; Real Postgres gives the SQLSTATE `42P01` for a table that does not exist. The Postgres method of
+;; `impl-table-known-to-not-exist?` looks for that SQLSTATE. For the same condition, the MotherDuck
+;; gateway sends the DuckDB "Catalog Error" message without that SQLSTATE. Therefore the Postgres
+;; method finds no match, and the exception continues instead of `driver/table-exists?` giving
+;; `false`. This method looks for the text of the DuckDB catalog error instead.
 (defmethod sql-jdbc/impl-table-known-to-not-exist? :motherduck
   [_driver e]
   (boolean (re-find #"(?i)catalog error.*does not exist" (or (.getMessage ^java.sql.SQLException e) ""))))
@@ -71,43 +74,51 @@
 ;;; |                                              Feature flags                                                      |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; Start conservative. Sync essentials (`:describe-fields`, `:describe-fks`, `:describe-is-nullable`,
-;; `:describe-default-expr`, `:schemas`, `:set-timezone`, `:basic-aggregations`) are inherited `true`
-;; from Postgres. Actions, table-privileges and database-replication are already `false` for
-;; non-`:postgres` drivers (see the `(= driver :postgres)` methods in `metabase.driver.postgres`).
-;; Everything below is disabled either because it isn't implemented against the DuckDB catalog yet, or
-;; because we don't emit (or can't trust) the corresponding metadata.
-(doseq [feature [:describe-indexes            ; no index sync (we don't override describe-indexes-sql)
-                 ;; DuckDB DOES create the column when the test-data loader emits `GENERATED ALWAYS AS
-                 ;; (...)`, but the inherited `describe-fields-sql` (`information_schema.columns.is_generated`)
-                 ;; comes back `false`/"NEVER" for it over the MotherDuck gateway regardless -- confirmed
-                 ;; by `describe-fields-returns-is-generated-test` failing with `[false false false]`
-                 ;; instead of `[false true false]`. `:database-is-generated` is stripped in
-                 ;; `describe-fields-pre-process-xf` below so this inaccurate value never surfaces.
+;; Start with a small set of features. The driver gets these necessary sync features as `true` from
+;; the Postgres driver: `:describe-fields`, `:describe-fks`, `:describe-is-nullable`,
+;; `:describe-default-expr`, `:schemas`, `:set-timezone` and `:basic-aggregations`. Actions, table
+;; privileges and database replication are already `false` for all drivers that are not `:postgres`.
+;; Refer to the `(= driver :postgres)` methods in `metabase.driver.postgres`. Each feature below is
+;; `false` for one of two reasons. The driver has no implementation of the feature against the DuckDB
+;; catalog. Or the driver cannot give correct metadata for the feature.
+(doseq [feature [:describe-indexes            ; No index sync. This driver has no `describe-indexes-sql` method.
+                 ;; DuckDB makes the column when the test data loader sends `GENERATED ALWAYS AS
+                 ;; (...)`. But the `describe-fields-sql` query of the parent driver reads
+                 ;; `information_schema.columns.is_generated`, and that column is always `false` or
+                 ;; "NEVER" over the MotherDuck gateway. The
+                 ;; `describe-fields-returns-is-generated-test` test shows this behavior. It gives
+                 ;; `[false false false]` and not `[false true false]`. The
+                 ;; `describe-fields-pre-process-xf` method below removes `:database-is-generated`.
+                 ;; Therefore this incorrect value does not go to the application.
                  :describe-is-generated
                  :uploads
                  :persist-models
                  :database-routing
                  :connection-impersonation
-                 ;; DuckDB has no row-level security or role-based GRANTs, so the connection-impersonation
-                 ;; test infra's role setup/teardown (`tx/with-temp-roles!` -> `ALTER TABLE ... DISABLE ROW
-                 ;; LEVEL SECURITY`, inherited from `:postgres`) doesn't work against the MotherDuck gateway.
+                 ;; DuckDB has no row-level security and no role-based GRANT statements. The test
+                 ;; code for connection impersonation makes and removes roles with
+                 ;; `tx/with-temp-roles!`. That code comes from the `:postgres` driver and sends
+                 ;; `ALTER TABLE ... DISABLE ROW LEVEL SECURITY`. It does not operate against the
+                 ;; MotherDuck gateway.
                  :test/rls-impersonation
                  :test/column-impersonation
-                 ;; FKs can be *read* (see describe-fks-sql), but the test-data loader can't create
-                 ;; them (DuckDB has no `ALTER TABLE ... ADD FOREIGN KEY`), so disable FK sync for now.
+                 ;; The driver can read the foreign keys. Refer to `describe-fks-sql`. But the test
+                 ;; data loader cannot make them, because DuckDB has no `ALTER TABLE ... ADD FOREIGN
+                 ;; KEY` statement. Therefore the foreign key sync is off.
                  :metadata/key-constraints
                  :transforms/table
                  :transforms/python
                  :transforms/index-ddl
-                 ;; DuckDB's regex engine (RE2, like BigQuery/Clickhouse/Presto/Redshift/Vertica/Athena
-                 ;; -- see their `:regex/lookaheads-and-lookbehinds false` overrides) doesn't support
-                 ;; Perl-style lookahead/lookbehind assertions. `:host`/`:domain`/`:subdomain`/`:path`
-                 ;; column extractions desugar to `regex-match-first` with hardcoded lookaround regexes
-                 ;; (`metabase.lib.filter.desugar.jvm`), which DuckDB's `regexp_extract` rejects outright:
-                 ;; "Invalid Input Error: invalid perl operator: (?<". Same root cause, same fix as the
-                 ;; other RE2-backed drivers -- this feature flag gates those tests off
-                 ;; (`mt/normal-drivers-with-feature :expressions :regex/lookaheads-and-lookbehinds`).
+                 ;; The regular expression engine of DuckDB is RE2. The BigQuery, ClickHouse, Presto,
+                 ;; Redshift, Vertica and Athena drivers use the same engine. Refer to their
+                 ;; `:regex/lookaheads-and-lookbehinds false` methods. RE2 does not support the Perl
+                 ;; lookahead assertions and lookbehind assertions. The `:host`, `:domain`,
+                 ;; `:subdomain` and `:path` column extractions become a `regex-match-first` clause
+                 ;; with such assertions. Refer to `metabase.lib.filter.desugar.jvm`. The DuckDB
+                 ;; `regexp_extract` function refuses these patterns with this message: "Invalid Input
+                 ;; Error: invalid perl operator: (?<". The cause and the correction are the same as
+                 ;; for the other RE2 drivers. This feature flag removes those tests. Refer to
+                 ;; `mt/normal-drivers-with-feature :expressions :regex/lookaheads-and-lookbehinds`.
                  :regex/lookaheads-and-lookbehinds]]
   (defmethod driver/database-supports? [:motherduck feature]
     [_driver _feature _db]
@@ -118,9 +129,10 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
 (def ^:private describe-database-tables-sql
-  ;; Tables + views for the connection's single database. `current_database()` scoping excludes the
-  ;; `system`/`temp` databases and all internal objects; views additionally filter `internal = false`.
-  ;; A vector so params can be added later without touching `describe-database*`.
+  ;; The tables and the views of the one database of the connection. The `current_database()`
+  ;; condition removes the `system` and `temp` databases and all internal objects. The condition for
+  ;; the views also removes the objects with `internal = true`. This value is a vector. Therefore the
+  ;; code can add parameters later without a change to `describe-database*`.
   [(str/join
     "\n"
     ["SELECT schema_name AS \"schema\", table_name AS \"name\", comment AS \"description\""
@@ -135,42 +147,55 @@
   [_driver database]
   {:tables (into #{} (sql-jdbc.execute/reducible-query database describe-database-tables-sql))})
 
-;; No `:motherduck` override: the inherited `:postgres` `describe-fields-sql` (an
-;; `information_schema.columns` query, `udt_name` as `:database-type`) works as-is against the
-;; MotherDuck gateway and returns the same lower-case pg type names query execution does, so
-;; `database-type->base-type` can be inherited unmodified too (see below). Removed the DuckDB-native
-;; `duckdb_columns()`/`duckdb_constraints()` version and the `database-type->base-type` override that
-;; existed solely to reconcile its upper-case DuckDB type strings with Postgres's lower-case map.
-;; TODO: re-add a `:motherduck` override if tests turn up cases the inherited query gets wrong
-;; (e.g. the `pg_catalog` materialized-view branch, `col_description()`, or identity/autoincrement
-;; detection, none of which are known to work against DuckDB's pg-wire emulation).
+;; There is no `:motherduck` method for `describe-fields-sql`. The `:postgres` method operates
+;; correctly against the MotherDuck gateway. That method reads `information_schema.columns` and gives
+;; `udt_name` as the `:database-type`. These are the same lower-case Postgres type names that query
+;; execution gives. Therefore the driver also keeps the `database-type->base-type` method of the
+;; parent driver. Refer to the note below.
+;;
+;; A DuckDB version of this query with `duckdb_columns()` and `duckdb_constraints()` was here before.
+;; A `database-type->base-type` method was here for the one purpose to change the upper-case DuckDB
+;; type names to the lower-case Postgres names. Both are removed.
+;;
+;; TODO: add a `:motherduck` method again if the tests find a case that the parent query gets wrong.
+;; For example, the `pg_catalog` branch for materialized views, the `col_description()` function, or
+;; the detection of an identity column. There is no evidence that these operate against the DuckDB
+;; emulation of the Postgres wire protocol.
 
-;; Skip the Postgres implementation, which tags columns whose type is a Postgres enum; DuckDB has no
-;; such dynamic types. `:database-is-generated` is also stripped here: the inherited `describe-fields-sql`
-;; still computes it (`information_schema.columns.is_generated`), but it comes back inaccurate over the
-;; MotherDuck gateway (see the `:describe-is-generated` feature flag above), so drop it rather than
-;; surface a wrong value.
+;; Do not use the Postgres method. That method marks each column whose type is a Postgres enum, and
+;; DuckDB has no such dynamic types. This method also removes `:database-is-generated`. The
+;; `describe-fields-sql` query of the parent driver still calculates that value from
+;; `information_schema.columns.is_generated`. But the value is incorrect over the MotherDuck gateway.
+;; Refer to the `:describe-is-generated` feature flag above. Therefore this method removes the value
+;; instead of a report of a wrong value.
 (defmethod sql-jdbc.sync/describe-fields-pre-process-xf :motherduck
   [_driver _database & _args]
   (map #(dissoc % :database-is-generated)))
 
-;; No Postgres enums to look up.
+;; There are no Postgres enum types to read.
 (defmethod driver/dynamic-database-types-lookup :motherduck
   [_driver _database _database-types]
   nil)
 
-;; The inherited `:sql-jdbc` `get-table-pks` calls pgjdbc's `DatabaseMetaData.getPrimaryKeys`, whose SQL
-;; self-joins `pg_class` and projects `information_schema._pg_expandarray(indkey)` through a subquery.
-;; DuckDB plans that shape pathologically: over the gateway it dies with "Out of Memory Error: failed to
-;; pin block of size 256.0 KiB (47.4 MiB/47.6 MiB used)". Verified 2026-07-29 to be the query shape and
-;; not data volume or connection reuse: it reproduces on the first statement of a brand-new connection
-;; against a catalog with 56 `pg_class` rows and an empty `pg_index`, and disappears as soon as the
-;; second `pg_class` alias (`ci.relname`, the PK_NAME column) is dropped from the select list. Reading
-;; the same information from `duckdb_constraints()` costs one cheap query. Overriding this method is the
-;; established escape hatch for backends whose JDBC `getPrimaryKeys` misbehaves (`:oracle`, `:snowflake`,
-;; `:clickhouse` all do it). Only `driver/table-exists?`'s default impl (via `describe-table`) reaches
-;; this on `:motherduck` -- sync itself uses the inherited `describe-fields`, which already derives `pk?`
-;; from `information_schema.table_constraints` and is unaffected.
+;; The `get-table-pks` method of the `:sql-jdbc` driver calls `DatabaseMetaData.getPrimaryKeys` of
+;; pgjdbc. The SQL of that call joins `pg_class` to itself. It also puts
+;; `information_schema._pg_expandarray(indkey)` in a subquery. DuckDB makes a very bad plan for that
+;; shape. Over the gateway the query stops with this message: "Out of Memory Error: failed to pin
+;; block of size 256.0 KiB (47.4 MiB/47.6 MiB used)".
+;;
+;; A test on 2026-07-29 shows that the cause is the shape of the query. The cause is not the quantity
+;; of data, and it is not the re-use of a connection. The error occurs on the first statement of a
+;; new connection. It occurs against a catalog with 56 `pg_class` rows and an empty `pg_index` table.
+;; The error stops when the second `pg_class` alias goes out of the select list. That alias is
+;; `ci.relname`, the PK_NAME column.
+;;
+;; The `duckdb_constraints()` function gives the same data with one inexpensive query. A method for
+;; `get-table-pks` is the usual correction for a database whose JDBC `getPrimaryKeys` function
+;; operates incorrectly. The `:oracle`, `:snowflake` and `:clickhouse` drivers all have such a
+;; method. On `:motherduck`, only the default `driver/table-exists?` method comes to this method, and
+;; it comes through `describe-table`. Sync uses the `describe-fields` method of the parent driver.
+;; That method finds `pk?` in `information_schema.table_constraints`. Therefore sync does not use
+;; this method.
 (def ^:private table-pks-sql
   (str "SELECT unnest(constraint_column_names) FROM duckdb_constraints()"
        " WHERE database_name = current_database() AND constraint_type = 'PRIMARY KEY'"
@@ -187,10 +212,11 @@
 
 (defmethod sql-jdbc.sync/describe-fks-sql :motherduck
   [driver & {:keys [schema-names table-names]}]
-  ;; `duckdb_constraints()` has no *referenced schema* column, so we assume the referenced (PK) table
-  ;; lives in the same schema as the FK table. `UNNEST` expands the multi-column list columns to one
-  ;; row per column. This is shipped for correctness even though FK sync is disabled by default
-  ;; (`:metadata/key-constraints` is false) because the test loader can't create FK constraints.
+  ;; The `duckdb_constraints()` function has no column for the schema of the referenced table.
+  ;; Therefore this query assumes that the referenced table is in the schema of the table with the
+  ;; foreign key. The `UNNEST` function makes one row for each column of a constraint with more than
+  ;; one column. This method is here for correctness. The foreign key sync is off, because
+  ;; `:metadata/key-constraints` is `false`. The test loader cannot make foreign key constraints.
   (sql/format
    {:select   [[:schema_name :fk-table-schema]
                [:table_name  :fk-table-name]
@@ -211,38 +237,49 @@
 ;;; |                                                Type mapping                                                     |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; No `:motherduck` override: `describe-fields-sql` now feeds `database-type->base-type` the same
-;; lower-case `udt_name`/pg wire type strings (`int4`, `varchar`, `timestamptz`, ...) whether the value
-;; came from sync or from query execution, so the inherited `:postgres` map (and its `column->semantic-type`,
-;; keyed on lower-case `"json"`) applies unmodified.
-;; TODO: re-add DuckDB-only type handling (`HUGEINT`, `STRUCT`/`MAP`/`UNION`, array types, etc.) here if
-;; sync tests turn up types Postgres's map doesn't recognize.
+;; There is no `:motherduck` method for `database-type->base-type`. The `describe-fields-sql` query
+;; gives `database-type->base-type` the same lower-case `udt_name` type names that query execution
+;; gives. For example, `int4`, `varchar` and `timestamptz`. Therefore the `:postgres` map operates
+;; correctly. The `column->semantic-type` function of that driver also operates correctly, because
+;; its key is the lower-case name `"json"`.
+;;
+;; TODO: add DuckDB type handling here if the sync tests find a type that the Postgres map does not
+;; know. For example, `HUGEINT`, `STRUCT`, `MAP`, `UNION` or the array types.
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Query processing                                                   |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; A string literal compiles to a bare parameter placeholder (`?`). MotherDuck's Postgres gateway
-;; can't deduce types involving an untyped parameter and rejects the prepared statement with
-;; "ambiguous result column types" whenever one determines a result column's type — a literal text
-;; expression (`SELECT ? AS "foo"`), a `CASE ... THEN ?` branch, a `CONCAT(col, ?)` arg, etc. An
-;; explicit CAST gives the gateway the type it needs (the narrow `::sql.qp/expression-literal-text-value`
-;; fix Redshift/Vertica use is subsumed by this: that clause compiles down to a plain string too, but
-;; alone it misses strings that reach `->honeysql` un-wrapped, e.g. `:case`/`:day-name` values).
-;; Numbers and booleans get inlined upstream, so strings are the only ambiguous literals left.
+;; A string literal compiles to a parameter placeholder (`?`) without a type. The MotherDuck
+;; Postgres gateway cannot find the type of such a parameter at prepare time. It ignores the
+;; parameter type that pgjdbc declares. Then it cannot find the type of a result column, and it
+;; refuses the prepared statement with this message: "Prepared statement with ambiguous result column
+;; types is not supported". This occurs for a text expression (`SELECT ? AS "foo"`), a
+;; `CASE ... THEN ?` branch, an argument of `CONCAT(col, ?)`, and other such statements.
+;;
+;; An explicit CAST gives the type to the gateway. The Redshift driver and the Vertica driver make a
+;; smaller correction with `::sql.qp/expression-literal-text-value`. This method includes that
+;; correction, because such a clause also compiles to a plain string. But that correction alone does
+;; not find the strings that come to `->honeysql` without a wrapper. For example, the values of a
+;; `:case` clause or a `:day-name` clause. Numbers and boolean values become inline literals before
+;; this point. Therefore strings are the only literals that keep no type.
 (defmethod sql.qp/->honeysql [:motherduck String]
   [_driver s]
   (h2x/cast :text s))
 
-;; `:starts-with`/`:contains`/`:ends-with` over a literal build a `LIKE` pattern whose `\`/`_`/`%`
-;; metacharacters are backslash-escaped by the `:sql` `escape-like-pattern` default. Postgres treats
-;; `\` as the LIKE escape character *by default*, so it parents on `::like-escape-char-built-in`, whose
-;; `transform-literal-like-pattern-honeysql` is the identity (it omits the `ESCAPE '\'` clause). DuckDB
-;; has NO default LIKE escape character, so inheriting that identity behavior leaves the backslashes
-;; literal and the matches shift/drop (confirmed: `starts-with "\"` returned `[]`, `starts-with "_"`
-;; returned the `\`-prefixed rows, etc.). Restore the SQL-standard `ESCAPE '\'` clause — the same
-;; honeysql the `:sql` default emits — which DuckDB honors (verified live:
-;; `'\Backslash' LIKE '\\%' ESCAPE '\'` is true, `LIKE '\_%' ESCAPE '\'` matches only `_`-prefixed).
+;; A `:starts-with`, `:contains` or `:ends-with` clause with a literal makes a `LIKE` pattern. The
+;; default `escape-like-pattern` method of the `:sql` driver puts a backslash before each `\`, `_`
+;; and `%` metacharacter. Postgres uses `\` as the LIKE escape character by default. Therefore the
+;; Postgres driver derives from `::like-escape-char-built-in`. The
+;; `transform-literal-like-pattern-honeysql` method of that parent gives the pattern back without a
+;; change. It does not add an `ESCAPE '\'` clause.
+;;
+;; DuckDB has no default LIKE escape character. Therefore the backslashes stay in the pattern and the
+;; results are incorrect. For example, `starts-with "\"` gave `[]`, and `starts-with "_"` gave the
+;; rows with a `\` prefix. This method adds the `ESCAPE '\'` clause of the SQL standard again. It is
+;; the same HoneySQL that the default `:sql` method makes. DuckDB obeys this clause. A live test
+;; shows this behavior: `'\Backslash' LIKE '\\%' ESCAPE '\'` is true, and `LIKE '\_%' ESCAPE '\'`
+;; finds only the rows with a `_` prefix.
 (defmethod sql.qp/transform-literal-like-pattern-honeysql :motherduck
   [_driver like-rhs-honeysql]
   [:escape like-rhs-honeysql [:inline "\\"]])
@@ -289,36 +326,42 @@
                (sql.qp.u/nfc-field->parent-identifier unwrapped-identifier nfc-field)
                [:inline json-path]])))
 
-;; Postgres compiles `:regex-match-first` to `substring(expr FROM pattern)` — a Postgres-only
-;; two-arg POSIX-regex overload of `substring`. DuckDB's `substring` has no such overload (only
-;; positional `substring(str, start[, len])`), so it silently tries to coerce the pattern string to
-;; an integer position and fails. Same fix as the DuckDB community driver
-;; (`modules/drivers/duckdb/src/metabase/driver/duckdb.clj`): DuckDB's native `regexp_extract`
-;; (default group 0 = whole match) is the direct equivalent.
+;; Postgres compiles `:regex-match-first` to `substring(expr FROM pattern)`. That form is a
+;; Postgres-only version of `substring` with two arguments and a POSIX regular expression. The DuckDB
+;; `substring` function does not have that version. It has only `substring(str, start[, len])` with
+;; a position. Therefore DuckDB tries to change the pattern string into an integer position, and it
+;; fails. The correction is the same as in the DuckDB community driver
+;; (`modules/drivers/duckdb/src/metabase/driver/duckdb.clj`). The DuckDB `regexp_extract` function is
+;; the equivalent function. Its default group is 0, the full match.
 (defmethod sql.qp/->honeysql [:motherduck :regex-match-first]
   [driver [_ _opts arg pattern]]
   [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
 
-;; Postgres parses a `YYYYMMDDHH24MISS`-formatted string with the 2-arg `to_timestamp(text, text)`
-;; format-string overload, which parses the fields then interprets them as local time in the session
-;; TimeZone to produce an absolute `timestamptz`; DuckDB's `to_timestamp` only has a 1-arg
-;; `(double) -> timestamptz` (Unix epoch) overload, so the inherited Postgres impl 404s ("No function
-;; matches ... to_timestamp(STRING, STRING)"). DuckDB's own string-with-format parser is `strptime`,
-;; using strftime-style `%` directives, but it only returns a zone-less `timestamp`. Casting that to
-;; `TIMESTAMPTZ` reproduces Postgres's exact semantics: DuckDB interprets the naive value as local time
-;; in the session TimeZone (confirmed live: `CAST(strptime(...) AS TIMESTAMPTZ)` under session tz
-;; America/New_York shifts the instant by the zone's offset, same as Postgres's `to_timestamp`) —
-;; `:set-timezone` is inherited unchanged from `:postgres`, so both drivers have the session TimeZone
-;; set the same way. This is why `:motherduck` sits alongside `:postgres`/`:h2`/`:databricks` (not
-;; `:mysql`/`:sqlserver`/`:presto-jdbc`, which can't produce a real `timestamptz` here) in the affected
-;; tests.
+;; Postgres reads a `YYYYMMDDHH24MISS` string with the `to_timestamp(text, text)` function with two
+;; arguments. That function reads the fields and interprets them as local time in the session
+;; TimeZone. It gives an absolute `timestamptz` value. The DuckDB `to_timestamp` function has only
+;; the version with one argument, `(double) -> timestamptz`, for a Unix epoch value. Therefore the
+;; Postgres method fails with this message: "No function matches ... to_timestamp(STRING, STRING)".
+;;
+;; The DuckDB function that reads a string with a format is `strptime`. It uses the `%` directives of
+;; strftime. But it gives a `timestamp` value without a zone. A cast of that value to `TIMESTAMPTZ`
+;; gives the same behavior as Postgres. DuckDB interprets the value without a zone as local time in
+;; the session TimeZone. A live test shows this behavior: with the session time zone
+;; America/New_York, `CAST(strptime(...) AS TIMESTAMPTZ)` moves the instant by the offset of that
+;; zone. The Postgres `to_timestamp` function does the same. This driver keeps the `:set-timezone`
+;; method of the `:postgres` driver. Therefore both drivers set the session TimeZone in the same way.
+;;
+;; This is the reason that the affected tests put `:motherduck` with `:postgres`, `:h2` and
+;; `:databricks`. The `:mysql`, `:sqlserver` and `:presto-jdbc` drivers cannot make a true
+;; `timestamptz` value here.
 (defmethod sql.qp/cast-temporal-string [:motherduck :Coercion/YYYYMMDDHHMMSSString->Temporal]
   [_driver _coercion-strategy expr]
   (h2x/cast "timestamptz" [:strptime expr (h2x/literal "%Y%m%d%H%M%S")]))
 
-;; Postgres casts a BYTEA column to text with `convert_from(expr, 'UTF8')`; DuckDB has no
-;; `convert_from` (it errors "Scalar Function with name convert_from does not exist"). DuckDB's own
-;; BLOB->VARCHAR decoder is `decode`, which assumes UTF8 same as Postgres's call here.
+;; Postgres changes a BYTEA column to text with `convert_from(expr, 'UTF8')`. DuckDB has no
+;; `convert_from` function. It gives this error: "Scalar Function with name convert_from does not
+;; exist". The DuckDB function that changes a BLOB into a VARCHAR is `decode`. It assumes UTF8, the
+;; same as the Postgres call here.
 (defmethod sql.qp/cast-temporal-byte [:motherduck :Coercion/YYYYMMDDHHMMSSBytes->Temporal]
   [driver _coercion-strategy expr]
   (sql.qp/cast-temporal-string driver :Coercion/YYYYMMDDHHMMSSString->Temporal [:decode expr]))
@@ -327,10 +370,11 @@
   [driver _coercion-strategy expr]
   (sql.qp/cast-temporal-string driver :Coercion/ISO8601->DateTime [:decode expr]))
 
-;; The Postgres implementations of these two methods delegate to `h2x` helpers that dispatch on the
-;; *db-type keyword* using the global hierarchy, which knows nothing about driver parentage — so they
-;; blow up on `:motherduck`. DuckDB understands the same `now()` / `expr + INTERVAL 'n unit'` SQL that
-;; those helpers emit for Postgres, so delegate with an explicit `:postgres` db-type.
+;; The Postgres methods for these two functions call `h2x` helper functions. Those helpers dispatch
+;; on the db-type keyword with the global hierarchy. That hierarchy does not know the parent of a
+;; driver. Therefore those helpers fail for `:motherduck`. DuckDB accepts the same `now()` SQL and
+;; the same `expr + INTERVAL 'n unit'` SQL that the helpers make for Postgres. Therefore these
+;; methods call the helpers with the `:postgres` db-type.
 (defmethod sql.qp/current-datetime-honeysql-form :motherduck
   [_driver]
   (h2x/current-datetime-honeysql-form :postgres))
@@ -339,19 +383,27 @@
   [_driver hsql-form amount unit]
   (h2x/add-interval-honeysql-form :postgres hsql-form amount unit))
 
-;; This override compiles to:
-;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', CAST("my_field" AS timestamp)))
-;; The inherited Postgres implementation compiles to:
+;; The Postgres method puts the time zone names into the HoneySQL form as plain strings, and
+;; HoneySQL makes a parameter for each one. That method compiles to:
 ;;   TIMEZONE(?, TIMEZONE(?, "my_field"))
-;; which MotherDuck's gateway rejects a bare `?` param inside a scalar function's argument list 
-;; because in these cases the bind phase is insufficient to figure out the type of these params. 
-;; Timezone names are rendered as inline string literals instead of params. The
-;; source-timezone-only branch's datetime arg gets the same treatment: converting a literal
-;; (`(convert-timezone "2024-01-01 00:00:00" "America/Los_Angeles" "UTC")`) would otherwise compile
-;; the literal to a bare `?` too --
+;; The MotherDuck gateway refuses this statement. It cannot find the type of a parameter without a
+;; type at prepare time. Then it cannot find the type of the result column. Refer to the note about
+;; `->honeysql [:motherduck String]`.
+;;
+;; Therefore this method makes each time zone name an inline string literal. For a field with a date
+;; or time database type, this method compiles to:
+;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', "my_field"))
+;;
+;; The `h2x/->pg-timestamp` function adds a cast only for an argument that has no date or time type.
+;; A literal datetime is such an argument. For example,
+;; `(convert-timezone "2024-01-01 00:00:00" "America/Los_Angeles" "UTC")` would otherwise compile the
+;; literal to a parameter without a type:
 ;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', ?))
-;; -- so it's wrapped in an explicit cast instead:
+;; With the cast, this method compiles to:
 ;;   TIMEZONE('America/Los_Angeles', TIMEZONE('UTC', CAST(? AS timestamp)))
+;;
+;; The other branch is for an argument that already has a time zone. That branch has no source time
+;; zone. It compiles to `TIMEZONE('America/Los_Angeles', expr)`.
 (defmethod sql.qp/->honeysql [:motherduck :convert-timezone]
   [driver [_ _opts arg target-timezone source-timezone]]
   (let [expr         (sql.qp/->honeysql driver (cond-> arg
@@ -370,11 +422,13 @@
 ;;; |                                          Driver-managed table DDL                                                |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; The stock `:sql-jdbc` impl runs DROP TABLE through `jdbc/execute!` -> pgjdbc `executeUpdate`, and
-;; DROP TABLE is one of the statement classes the gateway still returns a result set for even in
-;; compatibility mode (like CREATE/DROP DATABASE and CREATE/DROP VIEW — while e.g. CREATE TABLE on the
-;; same path succeeds; confirmed by `rename-tables-test` failing only in its `drop-table!` cleanup,
-;; 2026-07-15). Raw `Statement.execute` permits (and ignores) the returned result set.
+;; The `:sql-jdbc` method sends DROP TABLE through `jdbc/execute!`, which calls `executeUpdate` of
+;; pgjdbc. The gateway sends a result set for a DROP TABLE statement, also in compatibility mode.
+;; Then `executeUpdate` gives this error: "A result was returned when none was expected". A live test
+;; on 2026-08-01 shows this behavior. The same test shows that CREATE TABLE and INSERT on the same
+;; path give no result set. Refer to the note about `execute-sql!` in
+;; `metabase.test.data.motherduck` for the full list. The `Statement.execute` method permits a result
+;; set and ignores it.
 (defmethod driver/drop-table! :motherduck
   [driver db-id table-name]
   (let [sql (first (sql/format {:drop-table [:if-exists (keyword table-name)]}
@@ -386,9 +440,9 @@
        (with-open [stmt (.createStatement conn)]
          (.execute stmt ^String sql))))))
 
-;; The inherited `:postgres` impl loads rows over the wire COPY protocol (`COPY ... FROM STDIN`), which
-;; MotherDuck's gateway doesn't support; use the plain chunked-INSERT `:sql-jdbc` impl instead (same
-;; opt-out as `:redshift`).
+;; The `:postgres` method loads the rows with the COPY wire protocol (`COPY ... FROM STDIN`). The
+;; MotherDuck gateway does not support that protocol. Therefore this method calls the `:sql-jdbc`
+;; method, which sends INSERT statements in groups. The `:redshift` driver does the same.
 (defmethod driver/insert-into! :motherduck
   [driver db-id table-name column-names values]
   ((get-method driver/insert-into! :sql-jdbc) driver db-id table-name column-names values))
