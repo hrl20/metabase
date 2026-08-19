@@ -909,15 +909,9 @@
                     (set-json-unfolding-for-field! false)
                     (set-json-unfolding-for-db! true)
                     (set-json-unfolding-for-field! true)
-                    ;; Wait for the end of the sync. The `quick-task` function starts the sync in a
-                    ;; different thread. The sync must read the JSON column again. The code
-                    ;; polls for the result. A delay of 500 ms is sufficient for a local database. It is
-                    ;; not sufficient for a remote database. For example, the `:motherduck` driver
-                    ;; connects to the MotherDuck cloud gateway.
-                    (is (seq (u/poll {:thunk       nested-fields
-                                      :done?       seq
-                                      :timeout-ms  30000
-                                      :interval-ms 250}))))
+                    ;; Wait for the sync to finish
+                    (Thread/sleep 500)
+                    (is (seq (nested-fields))))
                   (testing "nested fields are added when json unfolding is enabled for the DB"
                     (set-json-unfolding-for-db! true)
                     (is (true? (:json-unfolding (:details (get-database)))))
