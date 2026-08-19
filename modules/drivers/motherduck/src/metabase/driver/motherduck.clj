@@ -28,7 +28,7 @@
    [metabase.util.date-2 :as u.date]
    [metabase.util.honey-sql-2 :as h2x])
   (:import
-   (java.sql Connection ResultSet Types)))
+   (java.sql Connection)))
 
 (set! *warn-on-reflection* true)
 
@@ -102,9 +102,15 @@
                  ;; MotherDuck gateway.
                  :test/rls-impersonation
                  :test/column-impersonation
-                 ;; The driver can read the foreign keys. Refer to `describe-fks-sql`. But the test
-                 ;; data loader cannot make them, because DuckDB has no `ALTER TABLE ... ADD FOREIGN
-                 ;; KEY` statement. Therefore the foreign key sync is off.
+                 ;; The test data loader cannot make foreign keys, because DuckDB has no
+                 ;; `ALTER TABLE ... ADD FOREIGN KEY` statement. Therefore the foreign key sync is
+                 ;; off. This driver has no `describe-fks-sql` method. A `:motherduck` method was
+                 ;; here before, but it was dead code. The `fetch-metadata/fk-metadata` function is
+                 ;; the only caller of `driver/describe-fks`, and it first examines
+                 ;; `:metadata/key-constraints`. That method also had a fault: `duckdb_constraints()`
+                 ;; has no column for the schema of the referenced table, thus the query assumed that
+                 ;; schema. To make the foreign key sync operate, first test the `pg_constraint`
+                 ;; query of the `:postgres` driver against the gateway.
                  :metadata/key-constraints
                  :transforms/table
                  :transforms/python
@@ -209,29 +215,6 @@
       (if (.next rs)
         (recur (conj pks (.getString rs 1)))
         pks))))
-
-(defmethod sql-jdbc.sync/describe-fks-sql :motherduck
-  [driver & {:keys [schema-names table-names]}]
-  ;; The `duckdb_constraints()` function has no column for the schema of the referenced table.
-  ;; Therefore this query assumes that the referenced table is in the schema of the table with the
-  ;; foreign key. The `UNNEST` function makes one row for each column of a constraint with more than
-  ;; one column. This method is here for correctness. The foreign key sync is off, because
-  ;; `:metadata/key-constraints` is `false`. The test loader cannot make foreign key constraints.
-  (sql/format
-   {:select   [[:schema_name :fk-table-schema]
-               [:table_name  :fk-table-name]
-               [[:unnest :constraint_column_names] :fk-column-name]
-               [:schema_name :pk-table-schema]
-               [:referenced_table :pk-table-name]
-               [[:unnest :referenced_column_names] :pk-column-name]]
-    :from     [[[:duckdb_constraints] :c]]
-    :where    [:and
-               [:= :constraint_type [:inline "FOREIGN KEY"]]
-               [:= :database_name [:current_database]]
-               (when (seq schema-names) [:in :schema_name schema-names])
-               (when (seq table-names) [:in :table_name table-names])]
-    :order-by [:schema_name :table_name]}
-   :dialect (sql.qp/quote-style driver)))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                                Type mapping                                                     |
