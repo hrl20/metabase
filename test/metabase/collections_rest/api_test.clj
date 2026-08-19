@@ -2567,7 +2567,7 @@
                                                                                   :param1 {:type         "dimension"
                                                                                            :display-name "Param 1"
                                                                                            :required     true
-                                                                                           :dimension    [:field (mt/id :venues :id) nil]}}
+                                                                                           :dimension    [:field 1 nil]}}
                                                                   :query         "select {{param0}}, {{param1}}"}}}]
         (is (partial= [{:name               "Business Card"
                         :entity_id          (:entity_id card)
