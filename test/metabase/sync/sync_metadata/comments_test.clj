@@ -142,12 +142,12 @@
             added-comment (mt/random-name)
             dbdef (basic-table table-name nil)]
         (mt/dataset dbdef
-          ;; Make the comment. Use the `execute-sql!` test extension of the driver. Do not call
-          ;; `jdbc/execute!` directly. The default `execute-sql!` method calls `jdbc/execute!` with the
-          ;; transactions off. The `:trino` driver needs the transactions off. A driver whose DDL needs
-          ;; a different JDBC method can replace that default method. The test data loader uses
-          ;; `execute-sql!` for all other DDL statements. It also uses `execute-sql!` for this same
-          ;; `standalone-table-comment-sql` statement when it makes the table.
+          ;; Add the comment via the driver's `execute-sql!` test extension rather than calling
+          ;; `jdbc/execute!` ourselves. The test data loader already runs this same
+          ;; `standalone-table-comment-sql` through it when it creates the table (see
+          ;; [[metabase.test.data.sql.ddl/create-db-tables-ddl-statements]]), so a driver that needs its DDL
+          ;; issued differently only has to override the one method. The default impl executes with
+          ;; `:transaction? false`, which trino needs.
           (sql-jdbc.execute/do-with-connection-with-options
            driver/*driver* (mt/db) {:write? true}
            (fn [conn]
