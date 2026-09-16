@@ -51,21 +51,8 @@
   [_driver]
   "[\n  [\n    [\n      \"a\",\n      \"b\"\n    ],\n    [\n      \"c\",\n      \"d\"\n    ]\n  ],\n  [\n    [\n      \"w\",\n      \"x\"\n    ],\n    [\n      \"y\",\n      \"z\"\n    ]\n  ]\n]")
 
-;; The `:motherduck` driver derives from the `:postgres` driver. The MotherDuck pg gateway sends a
-;; one-dimensional Postgres array with a correct array OID. For example, the OID of a `text[]` array
-;; is 1009. The pgjdbc driver reads such an array and gives a Clojure vector. Real Postgres has the
-;; same behavior.
-;;
-;; This test makes a nested array. Its depth is 2 or more. The gateway sends a nested array with the
-;; OID 17000. That OID is not a Postgres array type. A Postgres array is multi-dimensional but
-;; homogeneous. A Postgres array is not nested. Therefore the gateway cannot send a DuckDB
-;; `LIST(LIST(...))` value as a Postgres array. The gateway sends the DuckDB text of the list
-;; instead. That text has no quotation marks around the elements. That text is not JSON.
-;;
-;; This behavior is a limit of the gateway wire protocol. It is not a fault of the driver. A
-;; `psycopg2` test against the gateway shows this behavior. The `array[array['a','b']]` value has the
-;; OID 1009 and reads back as a list. The `array[array[array['a','b']]]` value has the OID 17000 and
-;; reads back as the text below.
+;; The MotherDuck Postgres endpoint returns this nested DuckDB list as text with OID 17000, which
+;; pgjdbc does not recognize as a Postgres array type. The text uses DuckDB list syntax, not JSON.
 (defmethod native-nested-array-results :motherduck
   [_driver]
   "[[[a, b], [c, d]], [[w, x], [y, z]]]")

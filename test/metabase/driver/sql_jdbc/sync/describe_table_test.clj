@@ -509,13 +509,9 @@
                      (sample)))
               (testing "If driver.sql/json-field-length is not implemented for the driver don't omit the long value"
                 (letfn [(registered-dispatch-value [driver]
-                          ;; The method can be on a parent driver and not on the driver itself. For example,
-                          ;; the `:motherduck` driver gets its method from the `:postgres` driver. The
-                          ;; `remove-method` function removes only a method with the same dispatch value. A
-                          ;; call with `driver` removes no method. Such a call also gives no error. This
-                          ;; function examines each parent driver. It starts at the nearest parent. It gives
-                          ;; the dispatch value of the applicable method. It gives `nil` if the driver has
-                          ;; only the `:default` method.
+                          ;; remove-method needs the registered dispatch value. A child such as
+                          ;; :motherduck can inherit its method from :postgres. Search the driver
+                          ;; and then its parents, returning nil if no method is registered there.
                           (loop [dispatch-values [driver]]
                             (when (seq dispatch-values)
                               (or (m/find-first #(contains? (methods driver.sql/json-field-length) %) dispatch-values)

@@ -160,10 +160,8 @@
     (mt/with-temp-copy-of-db
       (let [db (mt/db)
             db-spec (sql-jdbc.conn/db->pooled-connection-spec db)]
-        ;; The `with-temp-copy-of-db` macro copies only the Table metadata and the Field metadata. The
-        ;; copy keeps the connection details of the initial database. Therefore the DDL statements below
-        ;; change the real database. All other tests in the run use that same database. Drop the table at
-        ;; the end to keep the database clean.
+        ;; with-temp-copy-of-db copies Metabase metadata but keeps the original connection details.
+        ;; This DDL changes the shared test database, so remove the table in finally.
         (try
           (doseq [statement ["DROP TABLE IF EXISTS \"base_type_change_test\";"
                              "CREATE TABLE \"base_type_change_test\" (\"string_tbc_int_col\" VARCHAR);"

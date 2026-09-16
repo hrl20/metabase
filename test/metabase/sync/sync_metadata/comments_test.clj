@@ -148,12 +148,8 @@
             added-comment (mt/random-name)
             dbdef (basic-table table-name nil)]
         (mt/dataset dbdef
-          ;; Add the comment via the driver's `execute-sql!` test extension rather than calling
-          ;; `jdbc/execute!` ourselves. The test data loader already runs this same
-          ;; `standalone-table-comment-sql` through it when it creates the table (see
-          ;; [[metabase.test.data.sql.ddl/create-db-tables-ddl-statements]]), so a driver that needs its DDL
-          ;; issued differently only has to override the one method. The default impl executes with
-          ;; `:transaction? false`, which trino needs.
+          ;; Use the same execute-sql! extension as the test data loader so driver-specific DDL
+          ;; handling applies here too. The default disables transactions, as Trino requires.
           (sql-jdbc.execute/do-with-connection-with-options
            driver/*driver* (mt/db) {:write? true}
            (fn [conn]
