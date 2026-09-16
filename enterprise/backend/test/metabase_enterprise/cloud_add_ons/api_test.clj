@@ -7,7 +7,7 @@
    [metabase.premium-features.core :as premium-features]
    [metabase.test :as mt]))
 
-(deftest ^:sequential post-product-type-test
+(deftest ^:synchronized post-product-type-test
   (testing "POST /api/ee/cloud-add-ons/metabase-ai"
     (testing "requires superuser"
       (mt/with-premium-features #{}
@@ -71,7 +71,7 @@
                   (is (= (mt/user->id :crowberto) user_id))
                   (is (= {:add-on {:product-type "metabase-ai"}} details)))))))))))
 
-(deftest ^:sequential post-transforms-test
+(deftest ^:synchronized post-transforms-test
   (doseq [[product-type feature] [["python-execution"            :transforms-python]
                                   ["transforms"                  :transforms-basic]
                                   ["transforms-basic"            :transforms-basic]
@@ -93,11 +93,11 @@
                   (mt/user-http-request :crowberto :post 400 (str "ee/cloud-add-ons/" product-type) {})))))
       (testing "succeeds when all conditions are met"
         (mt/with-premium-features #{:hosting}
-          (with-redefs [hm.client/call (constantly nil)]
+          (mt/with-dynamic-fn-redefs [hm.client/call (constantly nil)]
             (is (=? {}
                     (mt/user-http-request :crowberto :post 200 (str "ee/cloud-add-ons/" product-type) {})))))))))
 
-(deftest ^:sequential post-dwh-rent-test
+(deftest ^:synchronized post-dwh-rent-test
   (testing "POST /api/ee/cloud-add-ons/dwh-rent"
     (testing "requires superuser"
       (mt/with-premium-features #{}
@@ -138,7 +138,7 @@
                                  {:product-type "etl-connections" :prepaid-units 1}]}
                        details))))))))))
 
-(deftest ^:sequential post-etl-connections-test
+(deftest ^:synchronized post-etl-connections-test
   (testing "POST /api/ee/cloud-add-ons/etl-connections"
     (testing "requires superuser"
       (mt/with-premium-features #{}
@@ -147,13 +147,13 @@
     (testing "is rejected as a bundle-only product type without calling the Store"
       (mt/with-premium-features #{:hosting}
         (let [{store-api-proxy :proxy store-api-calls :calls} (semantic.tu/spy (constantly nil))]
-          (with-redefs [hm.client/call store-api-proxy]
+          (mt/with-dynamic-fn-redefs [hm.client/call store-api-proxy]
             (is (=? "This add-on can only be purchased as part of a bundle."
                     (mt/user-http-request :crowberto :post 400 "ee/cloud-add-ons/etl-connections" {})))
             (is (empty? @store-api-calls)
                 "Store API was not called")))))))
 
-(deftest ^:sequential delete-product-type-test
+(deftest ^:synchronized delete-product-type-test
   (testing "DELETE /api/ee/cloud-add-ons/metabase-ai-managed"
     (testing "requires superuser"
       (mt/with-premium-features #{}
@@ -192,7 +192,7 @@
               (is (not-empty @clear-token-cache-calls)
                   "Token cache was cleared"))))))))
 
-(deftest ^:sequential delete-dwh-rent-test
+(deftest ^:synchronized delete-dwh-rent-test
   (testing "DELETE /api/ee/cloud-add-ons/dwh-rent"
     (testing "requires superuser"
       (mt/with-premium-features #{}
@@ -219,7 +219,7 @@
             (is (not-empty @clear-token-cache-calls)
                 "Token cache was cleared")))))))
 
-(deftest ^:sequential delete-etl-connections-test
+(deftest ^:synchronized delete-etl-connections-test
   (testing "DELETE /api/ee/cloud-add-ons/etl-connections"
     (testing "requires superuser"
       (mt/with-premium-features #{}
@@ -228,13 +228,13 @@
     (testing "is rejected as a bundle-only product type without calling the Store"
       (mt/with-premium-features #{:hosting}
         (let [{store-api-proxy :proxy store-api-calls :calls} (semantic.tu/spy (constantly nil))]
-          (with-redefs [hm.client/call store-api-proxy]
+          (mt/with-dynamic-fn-redefs [hm.client/call store-api-proxy]
             (is (=? "This add-on can only be purchased as part of a bundle."
                     (mt/user-http-request :crowberto :delete 400 "ee/cloud-add-ons/etl-connections")))
             (is (empty? @store-api-calls)
                 "Store API was not called")))))))
 
-(deftest ^:sequential get-plans-test
+(deftest ^:synchronized get-plans-test
   (testing "GET /api/ee/cloud-add-ons/plans"
     (testing "requires superuser"
       (mt/with-premium-features #{}
@@ -264,7 +264,7 @@
               (is (=? (:body plan-data)
                       (mt/user-http-request :crowberto :get 200 "ee/cloud-add-ons/plans"))))))))))
 
-(deftest ^:sequential get-addons-test
+(deftest ^:synchronized get-addons-test
   (testing "GET /api/ee/cloud-add-ons/addons"
     (testing "requires superuser"
       (mt/with-premium-features #{}

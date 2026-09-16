@@ -8,9 +8,11 @@
    [metabase.lib.metadata :as lib.metadata]
    [metabase.lib.schema :as lib.schema]
    [metabase.lib.schema.expression :as lib.schema.expression]
+   [metabase.lib.schema.mbql-clause :as lib.schema.mbql-clause]
    [metabase.lib.types.isa :as lib.types.isa]
    [metabase.lib.walk :as lib.walk]
    [metabase.query-processor.error-type :as qp.error-type]
+   ;; every path still reads field metadata from the ambient store when it's initialized, even the deprecated mbql5 shim
    ^{:clj-kondo/ignore [:deprecated-namespace]} [metabase.query-processor.store :as qp.store]
    [metabase.query-processor.timezone :as qp.timezone]
    [metabase.util.date-2 :as u.date]
@@ -47,12 +49,26 @@
 
 ;; TODO -- parsing the temporal string literals should be moved into `auto-parse-filter-values`, it's really a
 ;; separate transformation from just wrapping the value
+(defonce ^{:private true
+           :doc "Hierarchy grouping the java.time classes that share an [[add-type-info]] method. Kept separate from
+  Clojure's global hierarchy so that these class registrations cannot collide with other users of the global
+  hierarchy."}
+  hierarchy
+  (make-hierarchy))
+
+(defn- derive!
+  "Make `parent` an ancestor of `tag` in the temporal-class [[hierarchy]]."
+  [tag parent]
+  (alter-var-root #'hierarchy derive tag parent)
+  nil)
+
 (defmulti ^:private add-type-info
   "Wraps value literals in `:value` clauses that includes base type info about the Field they're being compared against
   for easy driver QP implementation. Temporal literals (e.g., ISO-8601 strings) get wrapped in `:time` or
   `:absolute-datetime` instead which includes unit as well; temporal strings get parsed and converted to "
   {:arglists '([x info & {:keys [parse-datetime-strings?]}])}
-  (fn [x & _] (class x)))
+  (fn [x & _] (class x))
+  :hierarchy #'hierarchy)
 
 (defmethod add-type-info nil
   [_ info & _]
@@ -62,10 +78,10 @@
   [this info & _]
   (lib/value info this))
 
-(derive LocalDate      ::->absolute-datetime)
-(derive LocalDateTime  ::->absolute-datetime)
-(derive OffsetDateTime ::->absolute-datetime)
-(derive ZonedDateTime ::->absolute-datetime)
+(derive! LocalDate      ::->absolute-datetime)
+(derive! LocalDateTime  ::->absolute-datetime)
+(derive! OffsetDateTime ::->absolute-datetime)
+(derive! ZonedDateTime  ::->absolute-datetime)
 
 (prefer-method add-type-info ::->absolute-datetime Object)
 
@@ -73,8 +89,8 @@
   [this info & _]
   (lib/absolute-datetime this (get info :unit :default)))
 
-(derive LocalTime  ::->time)
-(derive OffsetTime ::->time)
+(derive! LocalTime  ::->time)
+(derive! OffsetTime ::->time)
 
 (prefer-method add-type-info ::->time Object)
 
@@ -371,7 +387,7 @@
                             :semantic_type nil,
                             :database_type \"VARCHAR\",
                             :name \"description\"}]]]"
-  [mbql :- [:cat :keyword [:* :any]]]
+  [mbql :- ::lib.schema.mbql-clause/clause]
   (-> mbql
       lib/->mbql5
       (as-> $mbql (binding [*type-info* (fn [_query _path clause]

@@ -98,18 +98,26 @@ const AZURE_TYPE = createMockLlmProviderType({
 const BEDROCK_TYPE = createMockLlmProviderType({
   type: "bedrock",
   label: "Amazon Bedrock",
+  requires: {
+    "access-key-id": ["secret-access-key"],
+    "secret-access-key": ["access-key-id"],
+    "session-token": ["access-key-id", "secret-access-key"],
+  },
   fields: [
     createMockLlmProviderField({
       key: "access-key-id",
       label: "Access key ID",
       type: "password",
-      required: true,
+      required: false,
+      help: "Leave the keys blank to authenticate with the AWS default credentials chain (IRSA, EKS Pod Identity, or instance profile).",
+      docs_url:
+        "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html",
     }),
     createMockLlmProviderField({
       key: "secret-access-key",
       label: "Secret access key",
       type: "password",
-      required: true,
+      required: false,
     }),
     createMockLlmProviderField({
       key: "region",
@@ -268,11 +276,6 @@ async function openAdvancedSettings(modal: HTMLElement) {
   );
 }
 
-async function openModelPicker() {
-  await userEvent.click(screen.getByLabelText("Model"));
-  return await screen.findByRole("listbox");
-}
-
 describe("AIProviderSettingsSection", () => {
   afterEach(() => {
     reinitialize();
@@ -319,7 +322,6 @@ describe("AIProviderSettingsSection", () => {
     expect(
       screen.getByRole("button", { name: /Add another provider/ }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("Model")).toBeInTheDocument();
   });
 
   it("picks the provider and fills the key in when one is pasted", async () => {
@@ -539,6 +541,75 @@ describe("AIProviderSettingsSection", () => {
     expect(within(modal).getByLabelText("Session token")).not.toBeVisible();
   });
 
+  it("connects with the whole Bedrock key pair or with none of it", async () => {
+    await setup();
+
+    const modal = await openAddProviderModal();
+    await userEvent.click(
+      within(modal).getByRole("button", { name: "Amazon Bedrock" }),
+    );
+
+    expect(within(modal).getByText(/Leave the keys blank/)).toBeInTheDocument();
+    expect(
+      within(modal).getByRole("link", { name: "Where do I find this?" }),
+    ).toBeInTheDocument();
+    expect(
+      within(modal).getByRole("button", { name: "Connect" }),
+    ).toBeEnabled();
+
+    await userEvent.type(
+      within(modal).getByLabelText(/Access key ID/),
+      "AKIA123",
+    );
+    expect(
+      within(modal).getByRole("button", { name: "Connect" }),
+    ).toBeDisabled();
+
+    await userEvent.type(
+      within(modal).getByLabelText(/Secret access key/),
+      "secret123",
+    );
+    expect(
+      within(modal).getByRole("button", { name: "Connect" }),
+    ).toBeEnabled();
+
+    await userEvent.clear(within(modal).getByLabelText(/Access key ID/));
+    expect(
+      within(modal).getByRole("button", { name: "Connect" }),
+    ).toBeDisabled();
+  });
+
+  it("connects with a Bedrock session token only alongside the key pair", async () => {
+    await setup();
+
+    const modal = await openAddProviderModal();
+    await userEvent.click(
+      within(modal).getByRole("button", { name: "Amazon Bedrock" }),
+    );
+    await userEvent.click(
+      within(modal).getByRole("button", { name: /Advanced settings/ }),
+    );
+    await userEvent.type(
+      within(modal).getByLabelText(/Session token/),
+      "FwoG-token",
+    );
+    expect(
+      within(modal).getByRole("button", { name: "Connect" }),
+    ).toBeDisabled();
+
+    await userEvent.type(
+      within(modal).getByLabelText(/Access key ID/),
+      "AKIA123",
+    );
+    await userEvent.type(
+      within(modal).getByLabelText(/Secret access key/),
+      "secret123",
+    );
+    expect(
+      within(modal).getByRole("button", { name: "Connect" }),
+    ).toBeEnabled();
+  });
+
   it("opens advanced settings for a connection that already customized one", async () => {
     await setup({
       connections: [
@@ -653,87 +724,6 @@ describe("AIProviderSettingsSection", () => {
     expect(
       screen.queryByRole("button", { name: "Provider options" }),
     ).not.toBeInTheDocument();
-  });
-
-  it("lists models grouped by connection and saves the picked one", async () => {
-    await setup({
-      connections: [ANTHROPIC_CONNECTION, AZURE_CONNECTION],
-      models: CONNECTION_MODELS,
-      modelRef: "anthropic/claude-sonnet-4-5",
-    });
-
-    // closed, the picker names the provider too — the dropdown does not, because its group
-    // heading already does
-    await waitFor(() =>
-      expect(screen.getByLabelText("Model")).toHaveValue(
-        "Anthropic · Claude Sonnet 4.5",
-      ),
-    );
-
-    const listbox = await openModelPicker();
-
-    expect(within(listbox).getByText("Anthropic")).toBeInTheDocument();
-    expect(within(listbox).getByText("Azure prod")).toBeInTheDocument();
-    expect(
-      within(listbox).getByRole("option", { name: "Claude Haiku 4.5" }),
-    ).toBeInTheDocument();
-
-    await userEvent.click(
-      within(listbox).getByRole("option", { name: "GPT-5" }),
-    );
-
-    await waitFor(() => {
-      expect(
-        fetchMock.callHistory.called("path:/api/setting/llm-metabot-provider", {
-          method: "PUT",
-          body: { value: "azure-prod/gpt-5" },
-        }),
-      ).toBe(true);
-    });
-
-    expect(await screen.findAllByText("Changes saved")).toHaveLength(1);
-  });
-
-  it("surfaces a failure to save the picked model", async () => {
-    await setup({
-      connections: [ANTHROPIC_CONNECTION, AZURE_CONNECTION],
-      models: CONNECTION_MODELS,
-      modelRef: "anthropic/claude-sonnet-4-5",
-    });
-
-    // closed, the picker names the provider too — the dropdown does not, because its group
-    // heading already does
-    await waitFor(() =>
-      expect(screen.getByLabelText("Model")).toHaveValue(
-        "Anthropic · Claude Sonnet 4.5",
-      ),
-    );
-
-    fetchMock.modifyRoute("update-setting", {
-      response: { status: 400, body: { message: "Unsupported model" } },
-    });
-
-    const listbox = await openModelPicker();
-    await userEvent.click(
-      within(listbox).getByRole("option", { name: "GPT-5" }),
-    );
-
-    expect(await screen.findByText("Unsupported model")).toBeInTheDocument();
-    expect(screen.queryByText("Changes saved")).not.toBeInTheDocument();
-  });
-
-  it("locks the model picker and names the env var when the model is set by one", async () => {
-    await setup({
-      connections: [ANTHROPIC_CONNECTION],
-      models: CONNECTION_MODELS,
-      modelRef: "anthropic/claude-sonnet-4-5",
-      modelRefEnvVar: "MB_LLM_METABOT_PROVIDER",
-    });
-
-    expect(
-      await screen.findByTestId("setting-env-var-message"),
-    ).toHaveTextContent("MB_LLM_METABOT_PROVIDER");
-    expect(screen.getByLabelText("Model")).toBeDisabled();
   });
 });
 

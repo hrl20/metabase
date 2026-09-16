@@ -1,21 +1,15 @@
 import { createSelector } from "@reduxjs/toolkit";
 import { getIn } from "icepick";
 
-import type { State } from "metabase/redux/store";
 import {
   getShallowDatabases as getDatabases,
   getShallowFields as getFields,
-  getShallowSegments as getSegments,
   getShallowTables as getTables,
-} from "metabase/selectors/metadata";
+} from "metabase/metadata-store";
+import type { State } from "metabase/redux/store";
 import type { Card } from "metabase-types/api";
 
-import type {
-  StubbedDatabase,
-  StubbedField,
-  StubbedSegment,
-  StubbedTable,
-} from "./types";
+import type { StubbedDatabase, StubbedField, StubbedTable } from "./types";
 import { idsToObjectMap } from "./utils";
 
 // A `type`, not an `interface`, so `useParams<ReferenceRouteParams>()` accepts
@@ -32,8 +26,6 @@ export interface ReferenceRouteProps {
 }
 
 interface ReferenceSliceState {
-  isLoading: boolean;
-  error: unknown;
   isEditing: boolean;
   isFormulaExpanded: boolean;
 }
@@ -51,12 +43,6 @@ export { getUser } from "metabase/current-user";
 
 export const getSegmentId = (_state: State, props: ReferenceRouteProps) =>
   Number.parseInt(props.params.segmentId ?? "");
-export const getSegment = createSelector(
-  [getSegmentId, getSegments],
-  (segmentId, segments): StubbedSegment =>
-    segments?.[segmentId] || { id: segmentId },
-);
-
 export const getDatabaseId = (_state: State, props: ReferenceRouteProps) =>
   Number.parseInt(props.params.databaseId ?? "");
 
@@ -74,21 +60,10 @@ export const getTablesByDatabase = createSelector(
   (tables, database) =>
     tables && database.tables ? idsToObjectMap(database.tables, tables) : {},
 );
-export const getTableBySegment = createSelector(
-  [getSegment, getTables],
-  (segment, tables): StubbedTable =>
-    segment.table_id && tables?.[segment.table_id]
-      ? tables[segment.table_id]
-      : { id: 0 },
-);
 export const getTable = createSelector(
-  [getTableId, getTables, getSegmentId, getTableBySegment],
-  (tableId, tables, segmentId, tableBySegment): StubbedTable =>
-    tableId
-      ? tables?.[tableId] || { id: tableId }
-      : segmentId
-        ? tableBySegment
-        : { id: 0 },
+  [getTableId, getTables],
+  (tableId, tables): StubbedTable =>
+    tableId ? tables?.[tableId] || { id: tableId } : { id: 0 },
 );
 
 export const getFieldId = (_state: State, props: ReferenceRouteProps) =>
@@ -97,17 +72,9 @@ export const getFieldsByTable = createSelector(
   [getTable, getFields],
   (table, fields) => (table.fields ? idsToObjectMap(table.fields, fields) : {}),
 );
-export const getFieldsBySegment = createSelector(
-  [getTableBySegment, getFields],
-  (table, fields) => (table.fields ? idsToObjectMap(table.fields, fields) : {}),
-);
 export const getField = createSelector(
   [getFieldId, getFields],
   (fieldId, fields): StubbedField => fields?.[fieldId] || { id: fieldId },
-);
-export const getFieldBySegment = createSelector(
-  [getFieldId, getFieldsBySegment],
-  (fieldId, fields): StubbedField => fields[fieldId] || { id: fieldId },
 );
 
 const getQuestions = (state: State) =>
@@ -132,14 +99,6 @@ export const getTableQuestions = createSelector(
     );
   },
 );
-
-export const getLoading = (state: State) =>
-  // Unjustified type cast. FIXME
-  (state as StateWithReference).reference.isLoading;
-
-export const getError = (state: State) =>
-  // Unjustified type cast. FIXME
-  (state as StateWithReference).reference.error;
 
 export const getHasSingleSchema = createSelector(
   [getTablesByDatabase],

@@ -27,11 +27,11 @@
     ;; mt/with-temporary-setting-values is not used here because we want to test the behavior of the function when the
     ;; api-key is blank or nil, and mt/with-temporary-setting-values will not allow us to set the api-key to blank
     ;; or nil.
-    (with-redefs [metabase.settings.models.setting/get-raw-value (+value-for-setting grv :api-key "")]
+    (mt/with-dynamic-fn-redefs [metabase.settings.models.setting/get-raw-value (+value-for-setting grv :api-key "")]
       (is (thrown-with-msg? Exception
                             #"Missing api-key."
                             (#'hm.client/->config))))
-    (with-redefs [metabase.settings.models.setting/get-raw-value (+value-for-setting grv :api-key nil)]
+    (mt/with-dynamic-fn-redefs [metabase.settings.models.setting/get-raw-value (+value-for-setting grv :api-key nil)]
       (is (thrown-with-msg? Exception
                             #"Missing api-key."
                             (#'hm.client/->config))))))
@@ -65,7 +65,7 @@
         (catch Exception e
           (ex-data e))))))
 
-(deftest ^:sequential call-error-ex-data-test
+(deftest ^:synchronized call-error-ex-data-test
   (testing "the Store's HTTP status and decoded error body are both available on ex-data"
     (is (= {:status         400
             :upsert-add-ons "This organization already has a product with the same metric-name."}

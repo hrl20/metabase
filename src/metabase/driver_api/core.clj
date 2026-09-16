@@ -4,6 +4,7 @@
   (:refer-clojure :exclude [replace compile])
   (:require
    [metabase.actions.core :as actions]
+   [metabase.actions.schema :as actions.schema]
    [metabase.api.common :as api]
    [metabase.app-db.core :as mdb]
    [metabase.appearance.core :as appearance]
@@ -60,6 +61,7 @@
    [metabase.warehouse-schema.models.table :as table]
    [potemkin :as p]))
 
+;; driver-api facade must keep re-exporting deprecated vars until all drivers migrate off them
 #_{:clj-kondo/ignore [:deprecated-var :discouraged-var]}
 (p/import-vars
  actions/cached-database
@@ -238,6 +240,10 @@
 (def schema.actions.args.row
   ":metabase.actions.args/row"
   :metabase.actions.args/row)
+
+(def schema.actions.execution-context
+  "::metabase.actions.schema/execution-context"
+  ::actions.schema/execution-context)
 
 (def schema.expression.temporal.timezone-id
   "::lib.schema.expression.temporal/timezone-id"

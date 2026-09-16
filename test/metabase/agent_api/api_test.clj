@@ -493,14 +493,16 @@
     (doseq [[label q] [["legacy top-level :type"
                         {:database (mt/id) :type "native" :native {:query "select 1"}}]
                        ["MBQL 5 native stage"
-                        {:lib/type "mbql/query"
+                        {:database (mt/id)
+                         :lib/type "mbql/query"
                          :stages   [{:lib/type "mbql.stage/native" :native "select 1"}]}]
-                       ["MBQL 5 native stage nested in a join"
-                        {:lib/type "mbql/query"
-                         :stages   [{:lib/type "mbql.stage/mbql"
-                                     :joins    [{:lib/type "mbql/join"
-                                                 :stages   [{:lib/type "mbql.stage/native"
-                                                             :native   "select 1"}]}]}]}]
+                       ["native source-query nested in a join"
+                        {:database (mt/id) :type "query"
+                         :query    {:source-table (mt/id :checkins)
+                                    :joins        [{:source-query {:native "select 1"}
+                                                    :alias        "j"
+                                                    :condition    [:= [:field (mt/id :checkins :id) nil]
+                                                                   [:field (mt/id :checkins :id) {:join-alias "j"}]]}]}}]
                        ["legacy nested native source-query"
                         {:database (mt/id) :type "query"
                          :query    {:source-query {:native "select 1"}}}]]]
@@ -1855,3 +1857,18 @@
       (is (= 1 (count (:resources resp))))
       (is (nil? (-> resp :resources first :content)))
       (is (some? (-> resp :resources first :error))))))
+
+(deftest decode-and-validate-query-strips-extra-keys-test
+  (testing "base64 query payloads are decoded, validated, and stripped of the query processor's internal keys"
+    ;; `:qp/source-card-id` and `:qp/stage-had-source-card` are keys the QP adds to a query while it runs and that
+    ;; permissions later read, so a client must never be able to send them in.
+    (let [encoded (u/encode-base64 (json/encode {:database          (mt/id)
+                                                 :type              "query"
+                                                 :qp/source-card-id 1
+                                                 :query             {:source-table              (mt/id :orders)
+                                                                     :qp/stage-had-source-card 1}}))
+          q       (#'agent-api.api/decode-and-validate-query encoded)]
+      (is (= :mbql/query (:lib/type q)))
+      (is (not (contains? q :qp/source-card-id)))
+      (is (every? (fn [stage] (not (contains? stage :qp/stage-had-source-card))) (:stages q))
+          "internal keys are stripped from every stage"))))

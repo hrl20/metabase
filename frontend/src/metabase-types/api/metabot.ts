@@ -1,3 +1,5 @@
+import type { EnterpriseSettings } from "./settings";
+
 import type {
   CardDisplayType,
   CardId,
@@ -14,6 +16,8 @@ import type {
   SuggestedTransform,
   Transform,
   UnsavedCard,
+  User,
+  UserPermissions,
 } from ".";
 
 export type MetabotFeedbackType =
@@ -87,7 +91,6 @@ export type MetabotSeriesConfig = {
 };
 
 export type MetabotChartConfig = {
-  image_base_64?: string;
   title?: string | null;
   description?: string | null;
   data?: Array<{
@@ -157,7 +160,7 @@ export type MetabotAgentRequest = {
   parent_message_id?: string;
   retry_message_id?: string;
   user_message_id?: string; // uuid
-  assistant_message_id?: string; // uuid
+  assistant_message_id: string; // uuid
   metabot_id?: string;
   profile_id?: string;
 };
@@ -296,6 +299,37 @@ export type McpAppsFeedback = {
 export type SubmitMcpAppsFeedbackRequest = {
   mcpSessionId: string;
   payload: McpAppsFeedback;
+};
+
+/**
+ * The current-user projection `GET /api/embed-mcp/bootstrap` returns.
+ *
+ * Deliberately much narrower than `User`: the iframe's UI credential is minted from an
+ * MCP token that may hold nothing but `agent:query:run`, so it must not be able to read
+ * the full profile. Adding a field here means adding it to `::bootstrap-user` in
+ * `metabase.mcp.callback-api`, which is where that decision belongs.
+ */
+export type McpAppsBootstrapUser = Pick<
+  User,
+  | "id"
+  | "locale"
+  | "is_superuser"
+  | "is_data_analyst"
+  | "is_qbnewb"
+  | "tenant_id"
+  | "personal_collection_id"
+> & {
+  permissions: Pick<
+    UserPermissions,
+    "can_create_queries" | "can_create_native_queries"
+  >;
+};
+
+export type McpAppsBootstrapResponse = {
+  user: McpAppsBootstrapUser;
+
+  /** The settings a non-admin authenticated user may read, whoever the credential belongs to. */
+  settings: EnterpriseSettings;
 };
 
 /* Metabot v3 - Entity Types */

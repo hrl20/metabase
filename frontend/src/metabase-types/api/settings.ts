@@ -391,6 +391,8 @@ export type PasswordComplexity = {
 
 export type SessionCookieSameSite = "lax" | "strict" | "none";
 
+export type MfaEnforcement = "off" | "optional" | "required";
+
 export interface SettingDefinition<
   Key extends EnterpriseSettingKey = EnterpriseSettingKey,
 > {
@@ -452,9 +454,7 @@ interface InstanceSettings {
   "email-smtp-username": string | null;
   "email-smtp-password": string | null;
   "enable-embedding": boolean;
-  "enable-embedding-static": boolean;
-  "enable-embedding-sdk": boolean;
-  "enable-embedding-simple": boolean;
+  "enable-embedding-modular": boolean;
   "enable-embedding-interactive": boolean;
   "enable-nested-queries": boolean;
   "enable-public-sharing": boolean;
@@ -507,8 +507,7 @@ interface AdminSettings {
   "version-info"?: VersionInfo | null;
   "last-acknowledged-version": string | null;
   "show-static-embed-terms": boolean | null;
-  "show-sdk-embed-terms": boolean | null;
-  "show-simple-embed-terms": boolean | null;
+  "show-modular-embed-terms": boolean | null;
   "system-timezone"?: string;
   "embedding-homepage": EmbeddingHomepageStatus;
   "setup-license-active-at-setup": boolean;
@@ -532,6 +531,7 @@ interface SettingsManagerSettings {
   "llm-zai-api-key"?: string | null;
   "llm-mistral-api-key"?: string | null;
   "llm-moonshot-api-key"?: string | null;
+  "llm-deepseek-api-key"?: string | null;
   "llm-azure-api-key"?: string | null;
   "llm-azure-api-base-url"?: string | null;
   "llm-google-service-account-key"?: string | null;
@@ -542,6 +542,8 @@ interface SettingsManagerSettings {
   "llm-bedrock-secret-access-key"?: string | null;
   "llm-bedrock-region"?: string | null;
   "llm-bedrock-session-token"?: string | null;
+  "llm-vllm-api-base-url"?: string | null;
+  "llm-vllm-api-key"?: string | null;
   "openai-api-key": string | null;
   "openai-available-models"?: OpenAiModel[];
   "openai-model": string | null;
@@ -585,7 +587,8 @@ interface PublicSettings {
   "llm-metabot-supports-reasoning?"?: boolean | null;
   "email-configured?": boolean;
   "embedding-app-origin": string | null;
-  "mfa-enforcement"?: "off" | "optional";
+  "mfa-enforcement": MfaEnforcement;
+  "mfa-requirement-deadline": string | null;
   "embedding-app-origins-sdk": string | null;
   "embedding-app-origins-interactive": string | null;
   "enable-password-login": boolean;
@@ -616,7 +619,7 @@ interface PublicSettings {
   "ldap-group-sync": boolean;
   "ldap-group-base": string | null;
   "ldap-group-mappings": Record<string /*ldap group name */, GroupId[]> | null;
-  "ldap-group-membership-filter"?: string;
+  "ldap-group-membership-filter"?: string | null;
   "ldap-user-provisioning-enabled?": boolean;
   "oidc-user-provisioning-enabled?": boolean;
   "loading-message": LoadingMessage;
@@ -771,10 +774,12 @@ export interface EnterpriseSettings extends Settings {
   "llm-openai-model"?: string;
   "llm-metabot-configured?"?: boolean | null;
   "llm-metabot-supports-reasoning?"?: boolean | null;
+  "llm-metabot-supports-fast-mode?"?: boolean | null;
   "llm-openrouter-api-key"?: string | null;
   "llm-zai-api-key"?: string | null;
   "llm-mistral-api-key"?: string | null;
   "llm-moonshot-api-key"?: string | null;
+  "llm-deepseek-api-key"?: string | null;
   "session-timeout": TimeoutValue | null;
   "search-engine": SearchEngineSettingValue | null;
   "scim-enabled"?: boolean | null;
@@ -832,6 +837,8 @@ export interface EnterpriseSettings extends Settings {
   "python-runner-timeout-seconds"?: number | null;
   "python-runner-test-run-timeout-seconds"?: number | null;
   "llm-metabot-provider"?: string | null;
+  "llm-mini-model"?: string | null;
+  "llm-fast-mode"?: boolean | null;
   "llm-anthropic-api-key"?: string | null;
   "llm-anthropic-model": string;
   "llm-proxy-configured?"?: boolean | null;
